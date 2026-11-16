@@ -1,0 +1,13 @@
+// Prisma schema: https://www.prisma.io/docs/orm/v7/prisma-schema/overview
+// The connection URL is configured in prisma.config.ts, not here.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// TODO(stage 2): add User, Conversation, and Message models plus the first migration.
