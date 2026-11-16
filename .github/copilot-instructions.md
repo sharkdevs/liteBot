@@ -46,16 +46,20 @@ npm run prisma:migrate -- --name <name> --create-only # new draft migration (int
 docker compose up -d --wait   # PostgreSQL 18 + Redis 8
 ```
 
-`npm test` (bootstrap, webhook, config) needs no database or Redis; webhook tests
-inject a fake conversation service and an in-memory queue.
+`npm test` (bootstrap, webhook, config, prompt builder, AI provider, AI response
+service) needs no database, Redis, or network; webhook tests inject a fake
+conversation service and an in-memory queue, and AI provider tests inject a fake
+`fetch`.
 `npm run test:integration` needs Redis and PostgreSQL (`docker compose up -d --wait`).
 Queue tests use a random BullMQ key prefix and delete only their own keys;
 persistence tests create a `litebot_test_<hex>` database via `TEST_DATABASE_URL`,
 apply migrations with `prisma migrate deploy`, and drop it afterwards. Never
 flush or stop the shared Compose Redis or touch the development database from
 tests. API startup requires a non-empty `WHATSAPP_VERIFY_TOKEN` and a PostgreSQL
-`DATABASE_URL`; tests inject synthetic configuration. Put Node test-runner
-options before file names.
+`DATABASE_URL`; worker startup requires `DATABASE_URL` and AI settings. Tests
+inject synthetic configuration and must never call live Azure. Put Node
+test-runner options before file names. Run unit and integration suites one after
+the other, not concurrently; parallel runs cause timing flakiness.
 
 `prisma migrate dev` refuses non-interactive shells. To draft a migration
 there, print SQL with
@@ -79,22 +83,28 @@ required column to a table that may have rows.
   connections use `@prisma/adapter-pg`.
 - Read configuration through the validated loaders in `src/config/env.ts`, not
   `process.env`: `loadApiEnv()` (port, verify token, log level, Redis, database
-  URL) for `src/server.ts` and `loadWorkerEnv()` (log level, Redis only) for
-  `src/worker.ts`. `server.ts` is the composition root: it constructs the
-  logger, Prisma client, Redis connection, `IncomingMessageQueue`, and
-  `ConversationService(new PrismaUnitOfWork(prisma), logger)`, then injects them
-  into `createApp({ logger, whatsappVerifyToken, conversationService, incomingMessageQueue })`.
+  URL) for `src/server.ts` and `loadWorkerEnv()` (log level, Redis, database
+  URL, AI settings) for `src/worker.ts`. `server.ts` is the API composition
+  root: it constructs the logger, Prisma client, Redis connection,
+  `IncomingMessageQueue`, and `ConversationService(new PrismaUnitOfWork(prisma), logger)`,
+  then injects them into
+  `createApp({ logger, whatsappVerifyToken, conversationService, incomingMessageQueue })`.
+  `worker.ts` is the worker composition root: it constructs the logger, Prisma
+  client, Redis connection, `ConversationService`,
+  `createAiProvider(env.ai, new PromptBuilder())`, and `AiResponseService`, then
+  passes `(job) => aiResponseService.process(job)` to `createMessageWorker()`.
   Keep `app.ts` free of `listen()`, environment loading, and Redis or Prisma
   construction so tests can use isolated dependencies.
 
-## Current implementation (Phase 3: persistence layer)
+## Current implementation (Phase 4: AI integration)
 
 - Implemented: GET verification, POST validation, saving each supported text
-  message (with its user and conversation) in PostgreSQL, then enqueueing it to
-  BullMQ queue `incoming-messages`, and a separate worker that only logs. Not
-  implemented: AI, caching, WhatsApp sending, status-webhook processing, or
-  signature verification. Do not interpret the target flow below as implemented
-  behavior.
+  message (with its user and conversation) in PostgreSQL, enqueueing it to
+  BullMQ queue `incoming-messages`, and a separate worker that generates an AI
+  reply through Azure AI Foundry and saves it as an `OUTBOUND` message. Not
+  implemented: caching, WhatsApp sending, status-webhook processing, signature
+  verification, or idempotent AI processing. Do not interpret the target flow
+  below as implemented behavior.
 - `WebhookController` owns GET verification and POST handling.
   `parseWebhookPayload(unknown)` validates the complete batch before logging or
   saving and returns only modeled fields. Only `field: "messages"` +
@@ -122,6 +132,22 @@ required column to a table that may have rows.
   Do not switch to `addBulk` or other multi/pipeline paths: BullMQ 6.7.6's
   node-redis adapter has no `NOSCRIPT` fallback there, so they fail permanently
   after a Redis restart (covered by an integration test using `SCRIPT FLUSH`).
+- `AiResponseService.process(job)` loads up to 20 earlier messages from the
+  job's conversation (excluding the current message), calls
+  `IAiProvider.generateResponse(userMessage, conversationHistory)`, then saves
+  the reply with `ConversationService.saveOutboundMessage()`
+  (`whatsappMessageId` NULL). `PromptBuilder` sends the system prompt plus at
+  most 20 user/assistant messages, ending with the current message. Delivery is
+  at least once, so a retry after the reply is saved can create a duplicate
+  `OUTBOUND` row.
+- `AI_PROVIDER` selects `azure-foundry` (default) or the `openai` and `gemini`
+  placeholders, which reject with `Not implemented`. Azure uses the `openai`
+  SDK's `OpenAI` class with an HTTPS `/openai/v1/` endpoint; `AZURE_AI_MODEL` is
+  the Foundry deployment name. Keep `timeout: 30_000` and `maxRetries: 0`:
+  BullMQ owns retries, and SDK defaults (10 minutes, 2 retries) can hide stalls.
+- AI logs (`AI response generation started`, `AI response generated and saved`)
+  carry IDs, `modelName`, `responseLength`, and `durationMs`; never log
+  prompts, message text, model output, or API keys.
 - Jobs use 3 attempts with exponential backoff (1000 ms). Producer connections
   disable the offline queue and use a 2 s command timeout; worker connections
   keep the offline queue and have no command timeout (blocking reads). On
@@ -182,7 +208,7 @@ required column to a table that may have rows.
   Route errors through centralized error middleware; do not use `console.log`.
 - Keep TypeScript strict, avoid `any`, and use async/await.
 - Supply `.env.example` for server port, database, Redis, WhatsApp, and Azure
-  OpenAI configuration. `.gitignore` excludes `.env` and `.env.*` but explicitly
+  AI Foundry configuration. `.gitignore` excludes `.env` and `.env.*` but explicitly
   allows `.env.example`.
 - Local infrastructure uses Docker Compose for PostgreSQL and Redis; persistence
   changes should include Prisma migrations. ESLint and Prettier are configured.

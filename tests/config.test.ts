@@ -25,8 +25,16 @@ await test('worker configuration does not require the API token or HTTP port', (
     PORT: 'not-an-http-port',
     REDIS_HOST: '127.0.0.1',
     REDIS_PORT: '6380',
+    DATABASE_URL: 'postgresql://db.internal/litebot',
+    AZURE_AI_FOUNDRY_ENDPOINT: 'https://foundry.example.com/openai/v1/',
+    AZURE_AI_FOUNDRY_API_KEY: 'synthetic-key',
   });
   assert.deepEqual(worker.redis, { host: '127.0.0.1', port: 6380 });
+  assert.equal(worker.databaseUrl, 'postgresql://db.internal/litebot');
+  assert.equal(worker.ai.provider, 'azure-foundry');
+  assert.equal(worker.ai.endpoint, 'https://foundry.example.com/openai/v1/');
+  assert.equal(worker.ai.apiKey, 'synthetic-key');
+  assert.equal(worker.ai.modelName, 'phi-4-mini');
   assert.throws(() => loadApiEnv({ WHATSAPP_VERIFY_TOKEN: '' }), /WHATSAPP_VERIFY_TOKEN/);
 });
 
@@ -64,5 +72,103 @@ await test('API configuration accepts a PostgreSQL DATABASE_URL; the worker does
       databaseUrl,
     );
   }
-  assert.ok(!('databaseUrl' in loadWorkerEnv({})));
+  assert.equal(
+    loadWorkerEnv({
+      DATABASE_URL: 'postgresql://db.internal/litebot',
+      AZURE_AI_FOUNDRY_ENDPOINT: 'https://foundry.example.com/openai/v1/',
+      AZURE_AI_FOUNDRY_API_KEY: 'synthetic-key',
+    }).databaseUrl,
+    'postgresql://db.internal/litebot',
+  );
 });
+
+await test('API configuration does not require, validate, or expose Azure AI Foundry settings', () => {
+  const api = loadApiEnv({
+    ...apiSettings,
+    DATABASE_URL: 'postgresql://db.internal/litebot',
+    AI_PROVIDER: 'unsupported-provider',
+    AZURE_AI_FOUNDRY_ENDPOINT: 'http://foundry.example.com',
+  });
+  assert.ok(!('ai' in api));
+  assert.ok(!('aiProvider' in api));
+});
+
+await test('worker configuration requires a PostgreSQL DATABASE_URL', () => {
+  for (const databaseUrl of [undefined, '', 'not a url']) {
+    assert.throws(
+      () => loadWorkerEnv({ DATABASE_URL: databaseUrl }),
+      /DATABASE_URL must be a postgresql:\/\/ connection string/,
+    );
+  }
+});
+
+await test('worker configuration rejects missing Azure AI credentials without leaking values', () => {
+  const source = {
+    DATABASE_URL: 'postgresql://db.internal/litebot',
+    AZURE_AI_FOUNDRY_API_KEY: 'do-not-leak-this-key',
+  };
+  assert.throws(
+    () => loadWorkerEnv(source),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /AZURE_AI_FOUNDRY_ENDPOINT/);
+      assert.doesNotMatch(error.message, /do-not-leak-this-key/);
+      return true;
+    },
+  );
+  assert.throws(
+    () =>
+      loadWorkerEnv({
+        DATABASE_URL: source.DATABASE_URL,
+        AZURE_AI_FOUNDRY_ENDPOINT: 'https://foundry.example.com/openai/v1/',
+      }),
+    /AZURE_AI_FOUNDRY_API_KEY/,
+  );
+});
+
+await test('worker configuration requires an HTTPS Azure AI Foundry endpoint', () => {
+  assert.throws(
+    () =>
+      loadWorkerEnv({
+        DATABASE_URL: 'postgresql://db.internal/litebot',
+        AZURE_AI_FOUNDRY_ENDPOINT: 'http://foundry.example.com',
+        AZURE_AI_FOUNDRY_API_KEY: 'synthetic-key',
+      }),
+    /AZURE_AI_FOUNDRY_ENDPOINT must be a valid HTTPS Foundry OpenAI v1 URL/,
+  );
+});
+
+await test('worker configuration requires the Foundry OpenAI v1 endpoint path', () => {
+  assert.throws(
+    () =>
+      loadWorkerEnv({
+        DATABASE_URL: 'postgresql://db.internal/litebot',
+        AZURE_AI_FOUNDRY_ENDPOINT: 'https://foundry.example.com/',
+        AZURE_AI_FOUNDRY_API_KEY: 'synthetic-key',
+      }),
+    /AZURE_AI_FOUNDRY_ENDPOINT must be a valid HTTPS Foundry OpenAI v1 URL/,
+  );
+});
+
+await test('worker configuration rejects unsupported AI providers', () => {
+  assert.throws(
+    () =>
+      loadWorkerEnv({
+        DATABASE_URL: 'postgresql://db.internal/litebot',
+        AI_PROVIDER: 'unsupported-provider',
+        AZURE_AI_FOUNDRY_ENDPOINT: 'https://foundry.example.com/openai/v1/',
+        AZURE_AI_FOUNDRY_API_KEY: 'synthetic-key',
+      }),
+    /AI_PROVIDER must be azure-foundry/,
+  );
+});
+
+for (const provider of ['openai', 'gemini'] as const) {
+  await test(`worker configuration accepts ${provider} without Azure credentials`, () => {
+    const worker = loadWorkerEnv({
+      DATABASE_URL: 'postgresql://db.internal/litebot',
+      AI_PROVIDER: provider,
+    });
+    assert.deepEqual(worker.ai, { provider, modelName: provider });
+  });
+}

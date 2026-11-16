@@ -10,12 +10,13 @@ check it yourself. Read the chapters in order; later ones build on earlier ones.
 | [2. Webhook Foundation (Phase 1)](02-webhook-foundation.md)     | Ownership verification, dashboard/tunnel setup, payload validation, safe logging, and HTTP errors                                           |
 | [3. Queue Infrastructure (Phase 2)](03-queue-infrastructure.md) | Webhook → BullMQ → worker, job contract, correlation IDs, retries, shutdown, delivery limits, and who starts workers                        |
 | [4. Persistence Layer (Phase 3)](04-persistence-layer.md)       | PostgreSQL as the source of truth, the data model and WhatsApp conversations, migrations, repositories, transactions, locks, and duplicates |
+| [5. AI Integration (Phase 4)](05-ai-integration.md)             | Provider abstraction, prompt construction, recent context from PostgreSQL, Azure AI Foundry, and saved-but-unsent responses                 |
 
 The user numbers the implementation phases from the webhook work, so Phase 1 is
-Chapter 2, Phase 2 is Chapter 3, and Phase 3 is Chapter 4; the earlier bootstrap
-stays Chapter 1. Upcoming chapters will cover authenticated deliveries, AI
-replies, and the end-to-end flow. Automatic worker startup and scaling will be
-revisited after the end-to-end proof of concept works
+Chapter 2, Phase 2 is Chapter 3, Phase 3 is Chapter 4, and Phase 4 is Chapter 5;
+the earlier bootstrap stays Chapter 1. Future chapters can cover authenticated
+deliveries, WhatsApp sending, and reliability improvements. Automatic worker
+startup and scaling will be revisited after the end-to-end proof of concept works
 ([Chapter 3, section 13](03-queue-infrastructure.md#13-who-starts-the-worker-automatic-scaling-is-deferred)).
 
 For the practical Meta connection steps, start with the
@@ -102,3 +103,10 @@ Terms are added here as chapters introduce them.
 | AI memory (assistant thread) | The context an AI assistant keeps across messages, defined by our own rules; a separate concept from a WhatsApp conversation.                                       |
 | Backfill                     | Filling a newly added column for rows that existed before it, usually inside the migration that adds it.                                                            |
 | `prisma migrate diff`        | A read-only Prisma command that prints the SQL needed to move one schema state, such as a live database, to another.                                                |
+| AI provider                  | An adapter that implements the application's AI contract while hiding a vendor's SDK and request format.                                                            |
+| Provider abstraction         | An interface that lets application code request a capability without depending on the service that provides it.                                                     |
+| Prompt                       | The instructions and conversation messages sent to an AI model for one response.                                                                                    |
+| Prompt builder               | Code that combines the system prompt, recent conversation messages, and the current user message into chat context.                                                 |
+| System prompt                | An application-authored instruction that establishes the assistant's role for a model request.                                                                      |
+| Model deployment             | A named model endpoint configured in Azure AI Foundry; the deployment name is sent in the request's `model` field.                                                  |
+| Chat completion              | A generated assistant message based on an ordered list of system, user, and assistant messages.                                                                     |

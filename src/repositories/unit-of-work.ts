@@ -10,6 +10,8 @@ export interface Repositories {
 }
 
 export interface IUnitOfWork {
+  /** Runs work in one transaction without acquiring a sender-specific advisory lock. */
+  run<T>(work: (repositories: Repositories) => Promise<T>): Promise<T>;
   /**
    * Runs `work` in one database transaction: its changes are saved together, or not at
    * all if it throws. Calls that share a `lockKey` run one at a time.
@@ -19,6 +21,16 @@ export interface IUnitOfWork {
 
 export class PrismaUnitOfWork implements IUnitOfWork {
   constructor(private readonly prisma: PrismaClient) {}
+
+  run<T>(work: (repositories: Repositories) => Promise<T>): Promise<T> {
+    return this.prisma.$transaction((tx) =>
+      work({
+        users: new UserRepository(tx),
+        conversations: new ConversationRepository(tx),
+        messages: new MessageRepository(tx),
+      }),
+    );
+  }
 
   runExclusive<T>(lockKey: string, work: (repositories: Repositories) => Promise<T>): Promise<T> {
     // Interactive transaction: https://www.prisma.io/docs/orm/v7/prisma-client/queries/transactions#interactive-transactions

@@ -4,13 +4,15 @@ A backend for a **WhatsApp AI assistant**, built as a learning project. It start
 small proof of concept, but is organised so it can grow into a distributed,
 multi-region system without a rewrite.
 
-> **Current status: Phase 3 — Persistence Layer.** `GET /webhook` verifies
+> **Current status: Phase 4 — AI Integration.** `GET /webhook` verifies
 > ownership. `POST /webhook` validates events, saves each supported text message
 > (with its sender and conversation) in PostgreSQL, puts a job for it on a BullMQ
-> queue in Redis, then acknowledges. A separate worker process takes the jobs and
-> logs them. There is no AI or reply sending yet. See
+> queue in Redis, then acknowledges. A separate worker loads recent history,
+> generates an AI response through `IAiProvider`, and stores it as an `OUTBOUND`
+> message. It does not send WhatsApp messages. See
 > [Persistence Layer](#persistence-layer),
-> [Asynchronous Processing](#asynchronous-processing), and
+> [Asynchronous Processing](#asynchronous-processing),
+> [AI Architecture](#ai-architecture), and
 > [Implementation phases](#implementation-phases).
 
 New here? Read the [learning guide](docs/README.md). It explains each stage from
@@ -23,14 +25,13 @@ first principles, in the order it was built. The full target requirements live i
 2. Meta's WhatsApp Cloud API forwards it to our **webhook**.
 3. We save the message and put a **job** on a queue, then reply to Meta at once.
 4. A separate **worker** process picks up the job, loads the conversation history,
-   asks **Azure OpenAI** for a reply, saves it, and sends it back through WhatsApp.
+   asks the configured **AI provider** for a reply, and saves it. Sending it back
+   through WhatsApp is not implemented.
 
 ## Architecture vision
 
-This is the target architecture, not the current request path. Phases 2 and 3
-implement the Webhook API → PostgreSQL → BullMQ → Worker part, with a worker
-that only logs. Loading history in the worker, Azure OpenAI, and WhatsApp sending
-are future work.
+The Webhook API → PostgreSQL → BullMQ → Worker → AI provider path is implemented
+through Phase 4. WhatsApp sending remains future work.
 
 ```text
  WhatsApp user
@@ -48,9 +49,18 @@ are future work.
  ┌──────────────────┐   pick up job    ┌─────┴──────┐
  │ BullMQ on Redis  │ ───────────────▶ │   Worker   │
  └──────────────────┘                  └────────────┘
-                                         │        │
-                                         ▼        ▼
-                                 Azure OpenAI   WhatsApp Cloud API
+                                         │
+                                         ▼
+                                  Prompt Builder
+                                         │
+                                         ▼
+                                    IAiProvider
+                                         │
+                                         ▼
+                                Azure AI Foundry
+                                         │
+                                         ▼
+                                 PostgreSQL reply
 ```
 
 Why split the API from the worker? Meta expects a fast reply to every webhook
@@ -59,24 +69,24 @@ the slow work happens elsewhere. The two can then be scaled independently.
 
 ## Tech stack
 
-| Concern         | Choice                                             |
-| --------------- | -------------------------------------------------- |
-| Runtime         | Node.js 22.13+ on 22.x, or 24+ (native ES modules) |
-| Language        | TypeScript 6 (strict)                              |
-| HTTP framework  | Express 5                                          |
-| Database        | PostgreSQL 18, accessed through Prisma 7           |
-| Queue and cache | Redis 8 with BullMQ                                |
-| AI              | Azure OpenAI via the `openai` SDK                  |
-| Logging         | Pino and pino-http                                 |
-| Local services  | Docker Compose                                     |
-| Code quality    | ESLint (typed rules) and Prettier                  |
+| Concern        | Choice                                               |
+| -------------- | ---------------------------------------------------- |
+| Runtime        | Node.js 22.13+ on 22.x, or 24+ (native ES modules)   |
+| Language       | TypeScript 6 (strict)                                |
+| HTTP framework | Express 5                                            |
+| Database       | PostgreSQL 18, accessed through Prisma 7             |
+| Queue          | Redis 8 with BullMQ                                  |
+| AI             | `IAiProvider`; Azure AI Foundry via the `openai` SDK |
+| Logging        | Pino and pino-http                                   |
+| Local services | Docker Compose                                       |
+| Code quality   | ESLint (typed rules) and Prettier                    |
 
 ## Local setup
 
 **Prerequisites:** Node.js 22.13+ on the 22.x release line, or Node.js 24+, npm,
 and Docker Desktop (or another Docker engine). The Node minimum matches ESLint's
-supported Node versions. Since Phase 3, both PostgreSQL and Redis must be running
-for the webhook to accept text messages.
+supported Node versions. PostgreSQL and Redis must be running for webhook
+processing; the worker also needs a configured Azure AI Foundry deployment.
 
 For step 3 below, follow [Generate your verification token](#generate-your-verification-token)
 for the exact command and `.env` instructions.
@@ -90,6 +100,8 @@ Copy-Item .env.example .env        # macOS/Linux: cp .env.example .env
 
 # 3. Generate a private token and save it as WHATSAPP_VERIFY_TOKEN in .env.
 #    An existing .env from the bootstrap stage needs this setting too.
+#    Set AZURE_AI_FOUNDRY_ENDPOINT, AZURE_AI_FOUNDRY_API_KEY, and AZURE_AI_MODEL
+#    for the worker. The model value is the deployment name; see docs/05-ai-integration.md.
 
 # 4. Start PostgreSQL (durable data) and Redis (the queue) in the background
 docker compose up -d --wait
@@ -114,9 +126,8 @@ curl http://localhost:3000/health
 ```
 
 The API logs `HTTP server listening` and `Redis connection ready`; the worker logs
-`Redis connection ready` and `Incoming message worker ready`. The API connects to
-PostgreSQL only when the first message arrives, so a wrong `DATABASE_URL` shows up
-as a `500` on that `POST`, not at startup.
+`Redis connection ready` and `Incoming message worker ready`. Prisma connects
+lazily, so a wrong `DATABASE_URL` appears when a message is persisted or processed.
 
 Stop these services with `docker compose down` (add `-v` to delete their data,
 including saved messages and any queued jobs). Their default ports are published only on
@@ -129,22 +140,22 @@ development-only lint dependency advisory.
 
 ## Commands
 
-| Command                         | What it does                                                         |
-| ------------------------------- | -------------------------------------------------------------------- |
-| `npm run dev`                   | Run the API (`src/server.ts`) with tsx, restarting on change         |
-| `npm run dev:worker`            | Run the worker (`src/worker.ts`) with tsx, restarting on change      |
-| `npm run build`                 | Generate Prisma Client, then compile `src/` to JavaScript in `dist/` |
-| `npm start`                     | Run the compiled API from `dist/server.js`                           |
-| `npm run start:worker`          | Run the compiled worker from `dist/worker.js`                        |
-| `npm run typecheck`             | Type-check without writing files                                     |
-| `npm test`                      | Startup, configuration, and webhook HTTP tests (no services needed)  |
-| `npm run test:integration`      | Real BullMQ and PostgreSQL tests (needs local Redis and PostgreSQL)  |
-| `npm run lint`                  | Run ESLint                                                           |
-| `npm run format`                | Format all files with Prettier                                       |
-| `npm run format:check`          | Report formatting problems without changing files                    |
-| `npm run prisma:generate`       | Generate the Prisma client into `src/generated/`                     |
-| `npm run prisma:migrate:deploy` | Apply committed migrations to the database in `DATABASE_URL`         |
-| `npm run prisma:migrate`        | Development only: create and apply a migration after a schema change |
+| Command                         | What it does                                                                     |
+| ------------------------------- | -------------------------------------------------------------------------------- |
+| `npm run dev`                   | Run the API (`src/server.ts`) with tsx, restarting on change                     |
+| `npm run dev:worker`            | Run the worker (`src/worker.ts`) with tsx, restarting on change                  |
+| `npm run build`                 | Generate Prisma Client, then compile `src/` to JavaScript in `dist/`             |
+| `npm start`                     | Run the compiled API from `dist/server.js`                                       |
+| `npm run start:worker`          | Run the compiled worker from `dist/worker.js`                                    |
+| `npm run typecheck`             | Type-check without writing files                                                 |
+| `npm test`                      | Startup, configuration, webhook, prompt, and provider tests (no services needed) |
+| `npm run test:integration`      | Real BullMQ and PostgreSQL tests (needs local Redis and PostgreSQL)              |
+| `npm run lint`                  | Run ESLint                                                                       |
+| `npm run format`                | Format all files with Prettier                                                   |
+| `npm run format:check`          | Report formatting problems without changing files                                |
+| `npm run prisma:generate`       | Generate the Prisma client into `src/generated/`                                 |
+| `npm run prisma:migrate:deploy` | Apply committed migrations to the database in `DATABASE_URL`                     |
+| `npm run prisma:migrate`        | Development only: create and apply a migration after a schema change             |
 
 To run only the startup regression test:
 
@@ -444,7 +455,8 @@ The worker terminal then logs `Incoming message processing started` and
 `Incoming message processing completed` with the same `correlationId`. If you
 send the sample again and it carries the same message ID, the API logs
 `Inbound message already saved` instead and the worker has nothing new to do.
-**No WhatsApp reply is expected:** the worker only logs in this phase.
+**No WhatsApp reply is expected:** the worker stores an AI-generated `OUTBOUND`
+message, but sending it through WhatsApp is not implemented.
 
 The dashboard sample proves that the callback path works. It does not prove
 that a real phone number/account is correctly connected or subscribed. Real
@@ -475,7 +487,7 @@ tunnel is stopped.
 | A sample POST returns 500, log shows Prisma error `P2021`         | The tables do not exist yet: run `npm run prisma:migrate:deploy`                                                                        |
 | A sample POST returns 500 for another reason                      | Read the `err` in the API log. If Redis is not reachable, run `docker compose up -d --wait redis`; the API reconnects without a restart |
 | The API logs `Incoming message queued`, worker silent             | Start the worker with `npm run dev:worker`; queued jobs wait in Redis until a worker runs                                               |
-| POST succeeds but there is no WhatsApp reply                      | Expected for Phase 3; AI replies and sending are not implemented                                                                        |
+| POST succeeds but there is no WhatsApp reply                      | Expected: Phase 4 stores an AI response as `OUTBOUND`; WhatsApp sending is not implemented                                              |
 
 Sources: [Meta callback configuration](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/create-webhook-endpoint#configure-webhooks),
 [Meta dashboard sample tests](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/set-up-whatsapp-echo-bot),
@@ -525,7 +537,7 @@ npm run build
 npm run start:worker      # compiled, from dist/worker.js
 ```
 
-It needs only Redis settings (`REDIS_HOST`, `REDIS_PORT`) and `LOG_LEVEL`, not
+It needs Redis settings, `DATABASE_URL`, and Azure AI Foundry settings, but not
 the HTTP port or verification token. It starts even if no messages arrive or
 Redis is still starting, and it shuts down on Ctrl+C or `SIGTERM`. Each job
 carries the request's `x-correlation-id`, so API and worker logs for one message
@@ -534,14 +546,53 @@ each job to one of them. BullMQ does not start workers by itself: today you star
 each one. Automatic startup and scaling are deferred; see
 [the roadmap](#automatic-worker-startup-and-scaling-deferred).
 
-The worker still only **logs** each job (with the message text redacted). It
-does not read or write the database, call Azure OpenAI, or send WhatsApp
-messages. Since Phase 3, PostgreSQL is the system of record and every job refers
-to a message that is already saved there (see
-[Persistence Layer](#persistence-layer)). Processing is still "at least once": a
-message may occasionally be processed twice.
-[Chapter 3](docs/03-queue-infrastructure.md) walks through the queue design,
-hands-on experiments, retries, tests, and these limits in detail.
+The worker loads recent history from PostgreSQL, generates an answer through
+`IAiProvider`, and stores it as an `OUTBOUND` row. It does not send WhatsApp
+messages. The queued job refers to the already-saved inbound row (see
+[Persistence Layer](#persistence-layer)). Processing is still "at least once":
+a retry after a response is saved can create another response row.
+[Chapter 3](docs/03-queue-infrastructure.md) explains the queue's delivery and
+retry behavior.
+
+## AI Architecture
+
+The worker's AI path keeps prompt construction, the model vendor, and saved
+conversation data in separate layers:
+
+```text
+Webhook
+   |
+Persist Message
+   |
+Queue
+   |
+Worker
+   |
+Prompt Builder
+   |
+IAiProvider
+   |
+Azure AI Foundry
+   |
+Store AI Response
+```
+
+`IAiProvider` is the application's contract. Today the configured
+`AzureAiFoundryProvider` implements it with the existing OpenAI SDK; `OpenAI`
+and `Gemini` provider classes are placeholders. The rest of the application
+depends on the interface, so a provider can be replaced without adding vendor
+SDK calls to the worker or persistence layers.
+
+`PromptBuilder` keeps the system prompt and role mapping out of provider
+transport code. It turns up to 19 earlier database messages plus the current
+inbound text into a chat prompt with at most 20 conversational messages. The
+system prompt is stored separately in `src/prompts/system.prompt.ts`.
+
+PostgreSQL owns the context: the worker reads saved messages and stores the
+generated answer as `OUTBOUND`. It does not rely on hidden state retained by a
+model. This is separate from Meta's WhatsApp conversation metadata. The worker
+logs identifiers, the model name, and response length, but never the generated
+message text. See [Chapter 5](docs/05-ai-integration.md) for the full walkthrough.
 
 ## Persistence Layer
 
@@ -560,10 +611,10 @@ Worker
 
 ### Redis stores operational state; PostgreSQL stores durable state
 
-| Store      | Kind of state | What it holds                                   | How long                                  |
-| ---------- | ------------- | ----------------------------------------------- | ----------------------------------------- |
-| Redis      | Operational   | Queued jobs, their status, retries              | Until processed and trimmed (latest 1000) |
-| PostgreSQL | Durable       | Users, conversations, and every inbound message | Until we deliberately delete it           |
+| Store      | Kind of state | What it holds                                                 | How long                                  |
+| ---------- | ------------- | ------------------------------------------------------------- | ----------------------------------------- |
+| Redis      | Operational   | Queued jobs, their status, retries                            | Until processed and trimmed (latest 1000) |
+| PostgreSQL | Durable       | Users, conversations, inbound messages, and generated replies | Until we deliberately delete it           |
 
 **Operational state** is work in progress ("this job is waiting", "this job failed
 twice"): useful now, disposable later. **Durable state** is the facts the system
@@ -652,16 +703,19 @@ its lock, duplicate handling, and this phase's limits from first principles.
 
 Defined in [`.env.example`](.env.example). Copy it to `.env`; never commit `.env`.
 
-| Variable                   | Used from | Purpose                                                                                        |
-| -------------------------- | --------- | ---------------------------------------------------------------------------------------------- |
-| `PORT`                     | Stage 1   | API HTTP port (default `3000`)                                                                 |
-| `LOG_LEVEL`                | Stage 1   | Pino log level for the API and worker (default `info`)                                         |
-| `DATABASE_URL`             | Phase 3   | PostgreSQL connection string; required by the API and read by the Prisma CLI (not the worker)  |
-| `REDIS_HOST`, `REDIS_PORT` | Phase 2   | Redis location for the BullMQ queue, used by the API and worker (defaults `localhost`, `6379`) |
-| `AZURE_OPENAI_*`           | Later     | Endpoint, API key, and deployment name for AI replies                                          |
-| `WHATSAPP_VERIFY_TOKEN`    | Phase 1   | Required non-empty token you choose for the GET handshake (API only)                           |
-| `WHATSAPP_ACCESS_TOKEN`    | Later     | Token for calling the WhatsApp Cloud API                                                       |
-| `WHATSAPP_PHONE_NUMBER_ID` | Later     | The WhatsApp business number that sends replies                                                |
+| Variable                    | Used from   | Purpose                                                                                    |
+| --------------------------- | ----------- | ------------------------------------------------------------------------------------------ |
+| `PORT`                      | Stage 1     | API HTTP port (default `3000`)                                                             |
+| `LOG_LEVEL`                 | Stage 1     | Pino log level for the API and worker (default `info`)                                     |
+| `DATABASE_URL`              | Phase 3 / 4 | PostgreSQL connection string; required by the API, worker, and Prisma CLI.                 |
+| `REDIS_HOST`, `REDIS_PORT`  | Phase 2     | Redis location for BullMQ, used by the API and worker (defaults `localhost`, `6379`).      |
+| `AI_PROVIDER`               | Phase 4     | AI adapter selection (`azure-foundry` by default; `openai` and `gemini` are placeholders). |
+| `AZURE_AI_FOUNDRY_ENDPOINT` | Phase 4     | Azure AI Foundry OpenAI v1 endpoint, including `/openai/v1/`.                              |
+| `AZURE_AI_FOUNDRY_API_KEY`  | Phase 4     | Foundry resource API key, required by the worker for `azure-foundry`.                      |
+| `AZURE_AI_MODEL`            | Phase 4     | Foundry deployment name passed to the API; example default `phi-4-mini`.                   |
+| `WHATSAPP_VERIFY_TOKEN`     | Phase 1     | Required non-empty token you choose for the GET handshake (API only).                      |
+| `WHATSAPP_ACCESS_TOKEN`     | Later       | Token for calling the WhatsApp Cloud API; not used yet.                                    |
+| `WHATSAPP_PHONE_NUMBER_ID`  | Later       | The WhatsApp business number that will send replies; not used yet.                         |
 
 `TEST_REDIS_PORT` (default `6379`) and `TEST_DATABASE_URL` (default: the Compose
 database on `127.0.0.1:5432`, used only to create and drop throwaway test
@@ -672,15 +726,15 @@ databases) are read only by `npm run test:integration`.
 ```text
 src/
 ├── server.ts          API entrypoint: Prisma, Redis, queue, HTTP server, shutdown
-├── worker.ts          Worker entrypoint: Redis, BullMQ worker, shutdown
+├── worker.ts          Worker entrypoint: Prisma, Redis, AI provider, BullMQ worker, shutdown
 ├── app.ts             Builds the Express app (middleware + routes)
 ├── config/            Environment parsing, the shared logger, Redis and Prisma connections
 ├── routes/            URL → handler wiring (/health and /webhook)
 ├── controllers/       Verification and inbound webhook handlers
 ├── domain/            Plain types for User, Conversation, Message, and domain errors
-├── services/          Application logic: recording inbound messages
+├── services/          Application logic: message persistence and AI response processing
 ├── repositories/      Database access via Prisma, and the unit of work (transactions)
-├── providers/         Azure OpenAI and WhatsApp clients (later stage)
+├── providers/         AI provider interface, Azure Foundry adapter, and placeholders
 ├── queues/            The incoming-messages queue (producer side)
 ├── workers/           The incoming-message job processor (consumer side)
 ├── middleware/        Correlation IDs and centralized 400/500 responses
@@ -699,14 +753,15 @@ docs/                  Learning guide, one chapter per stage
 | 1                            | Webhook ownership verification, payload validation, metadata logging, 400/500 handling                                                 | ✅ Done  |
 | 2                            | BullMQ queue in Redis, separate logging worker, retries, correlation IDs                                                               | ✅ Done  |
 | 3                            | PostgreSQL data model with WhatsApp conversation metadata, migrations, repositories, persisted inbound messages, duplicate recognition | ✅ Done  |
+| 4                            | Prompt building, provider abstraction, Azure AI Foundry generation, persisted `OUTBOUND` responses                                     | ✅ Done  |
 | Future                       | POST signature verification                                                                                                            | Planned  |
-| Future                       | AI provider, conversation cache, outbound placeholder, and end-to-end worker flow                                                      | Planned  |
+| Future                       | Redis-backed conversation cache (if needed) and WhatsApp message sending                                                               | Planned  |
 | Future                       | Idempotent processing and production durability (for example, a transactional outbox)                                                  | Planned  |
 | After the end-to-end PoC     | Containerized API and worker, automatic restarts, queue-based worker autoscaling                                                       | Deferred |
 
 The current phase follows the user's phase numbering; the original bootstrap
-remains Chapter 1 in the learning guide. Future implementation order will be
-decided stage by stage.
+remains Chapter 1 in the learning guide. Automatic worker startup and scaling
+remain deferred until the end-to-end proof of concept is complete.
 
 ## Scalability roadmap
 
@@ -739,7 +794,7 @@ things outside BullMQ:
    watch the Redis list `bull:incoming-messages:wait`.
 
 **We will revisit this once the proof of concept runs end to end.** Sensible
-limits depend on real job durations, Azure OpenAI rate limits, and
+limits depend on real job durations, Azure AI Foundry rate limits, and
 per-conversation ordering, none of which exist yet.
 [Chapter 3, section 13](docs/03-queue-infrastructure.md#13-who-starts-the-worker-automatic-scaling-is-deferred)
 explains the idea and the questions to answer first.

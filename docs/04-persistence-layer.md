@@ -16,11 +16,12 @@ Queue Job
 Worker
 ```
 
-The worker still only logs. There is no AI, no outbound WhatsApp message, and
-no business rule such as "start a new conversation after 24 hours". A
-conversation row represents a **WhatsApp conversation**, not a session the
-application invents (section 3). The goal is to understand durable storage
-before anything depends on it.
+At the end of Phase 3, the worker still only logged jobs. There was no AI, no
+outbound WhatsApp message, and no business rule such as "start a new conversation
+after 24 hours". Phase 4 later adds AI response generation and stores its result;
+it still does not send WhatsApp messages. A conversation row represents a
+**WhatsApp conversation**, not a session the application invents (section 3).
+The goal here is to understand durable storage before anything depends on it.
 
 By the end of this chapter you should understand:
 
@@ -1239,23 +1240,22 @@ ID, so this only affects forged or hand-written requests.
 
 ## 14. What comes next
 
-PostgreSQL now holds every inbound message, and each job points to a saved row.
-Later phases will:
+Phase 4 builds on these stored rows: the worker reads recent history, calls an
+abstract AI provider, and saves an `OUTBOUND` response. See
+[Chapter 5 - AI Integration](05-ai-integration.md) for the prompt, provider, and
+worker details.
 
-- have the worker load the conversation history from PostgreSQL,
-- add the `IAiProvider` interface and the Azure OpenAI implementation,
-- save the generated reply as an `OUTBOUND` message,
-- call the WhatsApp provider placeholder,
-- add the Redis-backed conversation cache,
-- process status webhooks to fill in the WhatsApp conversation columns
-  (section 3),
-- add a separate AI memory concept, only if recent messages turn out not to be
-  enough context (section 3),
-- authenticate webhook deliveries,
-- after the end-to-end flow works, revisit automatic worker startup and scaling
-  ([Chapter 3, section 13](03-queue-infrastructure.md#13-who-starts-the-worker-automatic-scaling-is-deferred)).
+Later work can add authenticated webhook deliveries, a Redis-backed conversation
+cache if needed, WhatsApp sending, status-webhook processing for WhatsApp
+conversation metadata (section 3), and idempotent response processing. AI memory
+would remain separate from WhatsApp `Conversation` if recent messages are not
+enough (section 3). After the end-to-end flow works, revisit automatic worker
+startup and scaling
+([Chapter 3, section 13](03-queue-infrastructure.md#13-who-starts-the-worker-automatic-scaling-is-deferred)).
 
 **Previous:** [Chapter 3 - Queue Infrastructure (Phase 2)](03-queue-infrastructure.md)
+
+**Next:** [Chapter 5 - AI Integration (Phase 4)](05-ai-integration.md)
 
 ## Official references
 

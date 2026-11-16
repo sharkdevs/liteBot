@@ -4,13 +4,34 @@ import type { RedisSettings } from './redis.js';
 
 const LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'] as const;
 type LogLevel = (typeof LOG_LEVELS)[number];
+const AI_PROVIDERS = ['azure-foundry', 'openai', 'gemini'] as const;
+export type AiProvider = (typeof AI_PROVIDERS)[number];
 
-export interface WorkerEnv {
+export interface AzureFoundrySettings {
+  readonly provider: 'azure-foundry';
+  readonly endpoint: string;
+  readonly apiKey: string;
+  readonly modelName: string;
+}
+
+export interface PlaceholderAiSettings {
+  readonly provider: 'openai' | 'gemini';
+  readonly modelName: 'openai' | 'gemini';
+}
+
+export type AiSettings = AzureFoundrySettings | PlaceholderAiSettings;
+
+interface RuntimeEnv {
   readonly logLevel: LogLevel;
   readonly redis: RedisSettings;
 }
 
-export interface Env extends WorkerEnv {
+export interface WorkerEnv extends RuntimeEnv {
+  readonly databaseUrl: string;
+  readonly ai: AiSettings;
+}
+
+export interface Env extends RuntimeEnv {
   readonly port: number;
   readonly whatsappVerifyToken: string;
   readonly databaseUrl: string;
@@ -48,7 +69,7 @@ function parseDatabaseUrl(value: string | undefined): string {
   return value;
 }
 
-export function loadWorkerEnv(source: NodeJS.ProcessEnv = process.env): WorkerEnv {
+function loadRuntimeEnv(source: NodeJS.ProcessEnv): RuntimeEnv {
   const host = source.REDIS_HOST ?? 'localhost';
   if (!host.trim()) {
     throw new Error('REDIS_HOST must be a non-empty hostname');
@@ -62,13 +83,77 @@ export function loadWorkerEnv(source: NodeJS.ProcessEnv = process.env): WorkerEn
   });
 }
 
+function parseAiProvider(value: string | undefined): AiProvider {
+  const provider = value ?? 'azure-foundry';
+  if (!AI_PROVIDERS.includes(provider as AiProvider)) {
+    throw new Error(`AI_PROVIDER must be ${AI_PROVIDERS.join(', ')}`);
+  }
+  return provider as AiProvider;
+}
+
+function parseAiSettings(source: NodeJS.ProcessEnv): AiSettings {
+  const provider = parseAiProvider(source.AI_PROVIDER);
+  switch (provider) {
+    case 'openai':
+      return Object.freeze({ provider, modelName: provider });
+    case 'gemini':
+      return Object.freeze({ provider, modelName: provider });
+    case 'azure-foundry':
+      return Object.freeze({
+        provider,
+        endpoint: parseAzureFoundryEndpoint(source.AZURE_AI_FOUNDRY_ENDPOINT),
+        apiKey: parseAzureFoundryApiKey(source.AZURE_AI_FOUNDRY_API_KEY),
+        modelName: parseAzureAiModel(source.AZURE_AI_MODEL),
+      });
+  }
+}
+
+function parseAzureFoundryEndpoint(value: string | undefined): string {
+  if (!value?.trim()) {
+    throw new Error('AZURE_AI_FOUNDRY_ENDPOINT must be configured');
+  }
+  const endpoint = URL.parse(value.trim());
+  if (
+    endpoint?.protocol !== 'https:' ||
+    !endpoint.hostname ||
+    endpoint.pathname.replace(/\/+$/, '') !== '/openai/v1' ||
+    endpoint.username ||
+    endpoint.password ||
+    endpoint.search ||
+    endpoint.hash
+  ) {
+    throw new Error('AZURE_AI_FOUNDRY_ENDPOINT must be a valid HTTPS Foundry OpenAI v1 URL');
+  }
+  return value.trim();
+}
+
+function parseAzureFoundryApiKey(value: string | undefined): string {
+  if (!value?.trim()) {
+    throw new Error('AZURE_AI_FOUNDRY_API_KEY must be configured');
+  }
+  return value;
+}
+
+function parseAzureAiModel(value: string | undefined): string {
+  if (value !== undefined && !value.trim()) {
+    throw new Error('AZURE_AI_MODEL must be a non-empty model name');
+  }
+  return value?.trim() ?? 'phi-4-mini';
+}
+
+export function loadWorkerEnv(source: NodeJS.ProcessEnv = process.env): WorkerEnv {
+  return Object.freeze({
+    ...loadRuntimeEnv(source),
+    databaseUrl: parseDatabaseUrl(source.DATABASE_URL),
+    ai: parseAiSettings(source),
+  });
+}
+
 export function loadApiEnv(source: NodeJS.ProcessEnv = process.env): Env {
   return Object.freeze({
     port: parsePort(source.PORT, 'PORT', 3000),
     whatsappVerifyToken: parseVerifyToken(source.WHATSAPP_VERIFY_TOKEN),
-    ...loadWorkerEnv(source),
+    ...loadRuntimeEnv(source),
     databaseUrl: parseDatabaseUrl(source.DATABASE_URL),
   });
 }
-
-// TODO(later stages): validate WhatsApp sending and AI settings when used.
