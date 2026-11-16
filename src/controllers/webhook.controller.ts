@@ -7,6 +7,7 @@ import type {
   IncomingMessageJob,
   IncomingMessageQueuePort,
 } from '../shared/types/incoming-message-job.js';
+import { unixSecondsToDate } from '../shared/utils/unix-time.js';
 import { parseWebhookPayload } from '../shared/utils/webhook-validation.js';
 
 type AcceptedMessage = Pick<
@@ -116,6 +117,7 @@ export class WebhookController {
           correlationId,
           phoneNumber: message.phoneNumber,
           whatsappMessageId: message.whatsappMessageId,
+          whatsappTimestamp: unixSecondsToDate(message.timestamp),
           content: message.messageText,
         });
       jobs.push({ correlationId, messageId, userId, conversationId, ...message });

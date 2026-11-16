@@ -320,6 +320,7 @@ await test('POST saves each text message, then enqueues jobs carrying its databa
       correlationId: 'webhook-queue-test',
       phoneNumber: '15550000001',
       whatsappMessageId,
+      whatsappTimestamp: new Date('2026-11-16T16:00:00Z'),
       content: 'PRIVATE_QUEUED_TEXT',
     })),
   );
@@ -387,7 +388,8 @@ await test('POST rejects a malformed later text message before saving or enqueue
   assert.deepEqual(jobs, []);
 });
 
-for (const timestamp of [undefined, 'not-a-timestamp', '-1', 1794844800]) {
+// The last value is one second past the latest moment a JavaScript Date can represent.
+for (const timestamp of [undefined, 'not-a-timestamp', '-1', 1794844800, '8640000000001']) {
   await test(`POST rejects an invalid text-message timestamp: ${String(timestamp)}`, async (t) => {
     const { url, jobs } = await startApp(t);
     const response = await fetch(url, {

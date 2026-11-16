@@ -9,6 +9,8 @@ export interface InboundTextMessage {
   readonly phoneNumber: string;
   /** Meta's message ID (`wamid...`). */
   readonly whatsappMessageId: string;
+  /** Meta's `timestamp` for the message. */
+  readonly whatsappTimestamp: Date;
   readonly content: string;
 }
 
@@ -32,7 +34,7 @@ export class ConversationService implements IConversationService {
   ) {}
 
   async recordInboundMessage(inbound: InboundTextMessage): Promise<RecordedInboundMessage> {
-    const { correlationId, phoneNumber, whatsappMessageId, content } = inbound;
+    const { correlationId, phoneNumber, whatsappMessageId, whatsappTimestamp, content } = inbound;
 
     // One sender's messages are saved one at a time, so two simultaneous first messages
     // cannot both create a user or a conversation.
@@ -52,9 +54,13 @@ export class ConversationService implements IConversationService {
         }
 
         const user = existingUser ?? (await users.create({ phoneNumber }));
+        // Inbound messages carry no WhatsApp conversation data, so a message joins the user's
+        // latest conversation. A new one is created only when the user has none; inactivity
+        // never starts one. Its WhatsApp metadata stays null until a webhook supplies it.
         const latestConversation = await conversations.findLatestForUser(user.id);
         const conversation =
-          latestConversation ?? (await conversations.create({ userId: user.id }));
+          latestConversation ??
+          (await conversations.create({ userId: user.id, startedAt: whatsappTimestamp }));
         const message = await messages.create({
           conversationId: conversation.id,
           whatsappMessageId,

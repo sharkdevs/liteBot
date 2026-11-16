@@ -30,13 +30,27 @@ model User {
   @@map("users")
 }
 
+// A WhatsApp conversation as reported by Meta, not a session the application invents.
+// Inbound messages carry no conversation data, so the WhatsApp fields stay null until a
+// webhook that does carry them (a status update for a message we send) enriches the row.
+// category and originType are text rather than enums: Meta adds values over time.
 model Conversation {
-  id        String    @id @default(uuid(7)) @db.Uuid
-  userId    String    @map("user_id") @db.Uuid
-  user      User      @relation(fields: [userId], references: [id])
-  messages  Message[]
-  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id                     String    @id @default(uuid(7)) @db.Uuid
+  userId                 String    @map("user_id") @db.Uuid
+  user                   User      @relation(fields: [userId], references: [id])
+  messages               Message[]
+  // Meta's conversation.id. Unique, so one WhatsApp conversation is stored once.
+  whatsappConversationId String?   @unique @map("whatsapp_conversation_id")
+  // Meta's pricing.category, e.g. "service" or "marketing".
+  category               String?
+  // Meta's conversation.origin.type, e.g. "service" or "marketing".
+  originType             String?   @map("origin_type")
+  // When the conversation began: the WhatsApp timestamp of the first message we stored in it.
+  startedAt              DateTime  @map("started_at") @db.Timestamptz(3)
+  // Meta's conversation.expiration_timestamp.
+  expiresAt              DateTime? @map("expires_at") @db.Timestamptz(3)
+  createdAt              DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   // Serves "latest conversation for a user" and the user_id foreign key.
   @@index([userId, createdAt(sort: Desc)])

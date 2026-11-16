@@ -39,11 +39,16 @@ function captureLogs() {
   return { logger, output: () => lines.join('') };
 }
 
-function inbound(phoneNumber: string, whatsappMessageId: string): InboundTextMessage {
+function inbound(
+  phoneNumber: string,
+  whatsappMessageId: string,
+  whatsappTimestamp = new Date('2026-11-17T09:00:00Z'),
+): InboundTextMessage {
   return {
     correlationId: 'persistence-test-correlation',
     phoneNumber,
     whatsappMessageId,
+    whatsappTimestamp,
     content: 'PRIVATE_MESSAGE_TEXT',
   };
 }
@@ -68,6 +73,12 @@ await test('persistence layer', async (t) => {
         where: { userId: user.id },
       });
       assert.equal(recorded.conversationId, conversation.id);
+      // An inbound message carries no WhatsApp conversation metadata, so none is invented.
+      assert.deepEqual(conversation.startedAt, new Date('2026-11-17T09:00:00Z'));
+      assert.equal(conversation.whatsappConversationId, null);
+      assert.equal(conversation.category, null);
+      assert.equal(conversation.originType, null);
+      assert.equal(conversation.expiresAt, null);
       const message = await prisma.message.findUniqueOrThrow({ where: { id: recorded.messageId } });
       assert.equal(message.conversationId, conversation.id);
       assert.equal(message.whatsappMessageId, 'wamid.first');
@@ -92,10 +103,17 @@ await test('persistence layer', async (t) => {
     const phoneNumber = syntheticPhoneNumber();
 
     const first = await service.recordInboundMessage(inbound(phoneNumber, 'wamid.later-1'));
-    const second = await service.recordInboundMessage(inbound(phoneNumber, 'wamid.later-2'));
+    // Days later: there is still no inactivity window that would start a new conversation.
+    const second = await service.recordInboundMessage(
+      inbound(phoneNumber, 'wamid.later-2', new Date('2026-11-30T09:00:00Z')),
+    );
 
     assert.equal(second.userId, first.userId);
     assert.equal(second.conversationId, first.conversationId);
+    const conversation = await prisma.conversation.findUniqueOrThrow({
+      where: { id: first.conversationId },
+    });
+    assert.deepEqual(conversation.startedAt, new Date('2026-11-17T09:00:00Z'));
     assert.notEqual(second.messageId, first.messageId);
     assert.equal(await prisma.user.count({ where: { phoneNumber } }), 1);
     assert.equal(await prisma.conversation.count({ where: { userId: first.userId } }), 1);
@@ -210,15 +228,56 @@ await test('persistence layer', async (t) => {
     assert.equal(await conversations.findLatestForUser(user.id), null);
 
     // Inserted newest first, so the result cannot depend on insertion order.
+    const startedAt = new Date('2026-01-01T00:00:00Z');
     const newer = await prisma.conversation.create({
-      data: { userId: user.id, createdAt: new Date('2026-02-01T00:00:00Z') },
+      data: { userId: user.id, startedAt, createdAt: new Date('2026-02-01T00:00:00Z') },
     });
     await prisma.conversation.create({
-      data: { userId: user.id, createdAt: new Date('2026-01-01T00:00:00Z') },
+      data: { userId: user.id, startedAt, createdAt: new Date('2026-01-01T00:00:00Z') },
     });
 
     assert.equal((await conversations.findLatestForUser(user.id))?.id, newer.id);
   });
+
+  await t.test(
+    'a conversation stores WhatsApp metadata, and one WhatsApp conversation ID maps to one row',
+    async () => {
+      const users = new UserRepository(prisma);
+      const conversations = new ConversationRepository(prisma);
+      const user = await users.create({ phoneNumber: syntheticPhoneNumber() });
+      const metadata = {
+        whatsappConversationId: 'whatsapp-conversation-1',
+        category: 'marketing',
+        originType: 'marketing',
+        expiresAt: new Date('2026-11-24T09:00:00Z'),
+      };
+
+      const created = await conversations.create({
+        userId: user.id,
+        startedAt: new Date('2026-11-17T09:00:00Z'),
+        ...metadata,
+      });
+
+      assert.deepEqual(await conversations.findLatestForUser(user.id), created);
+      assert.deepEqual(
+        {
+          whatsappConversationId: created.whatsappConversationId,
+          category: created.category,
+          originType: created.originType,
+          expiresAt: created.expiresAt,
+        },
+        metadata,
+      );
+      await assert.rejects(
+        conversations.create({
+          userId: user.id,
+          startedAt: new Date('2026-11-18T09:00:00Z'),
+          whatsappConversationId: 'whatsapp-conversation-1',
+        }),
+        { code: 'P2002' },
+      );
+    },
+  );
 
   await t.test(
     'a webhook request saves the message, then a worker consumes its job',
@@ -252,6 +311,7 @@ await test('persistence layer', async (t) => {
       const message = conversation?.messages[0];
       assert.equal(user.conversations.length, 1);
       assert.equal(conversation?.messages.length, 1);
+      assert.deepEqual(conversation.startedAt, new Date('2026-11-16T16:00:00Z'));
       assert.ok(message);
       const [job] = await fixture.inspector.getWaiting();
       assert.equal(job?.id, message.id);

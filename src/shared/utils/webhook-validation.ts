@@ -5,6 +5,7 @@ import type {
   WebhookPayload,
 } from '../types/webhook.types.js';
 import { BadRequestError } from './bad-request-error.js';
+import { isUnixSecondsString } from './unix-time.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -35,11 +36,7 @@ function parseMessage(input: unknown): Message {
     if (!isRecord(input.text) || !isNonEmptyString(input.text.body)) {
       throw new BadRequestError('A text message must have a non-empty text body');
     }
-    if (
-      typeof input.timestamp !== 'string' ||
-      !/^\d+$/.test(input.timestamp) ||
-      !Number.isSafeInteger(Number(input.timestamp))
-    ) {
+    if (!isUnixSecondsString(input.timestamp)) {
       throw new BadRequestError('A text message timestamp must be a Unix-seconds string');
     }
     message.text = { body: input.text.body };
