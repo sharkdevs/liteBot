@@ -4,9 +4,9 @@ liteBot is a starter backend for a WhatsApp AI assistant, intended to grow from 
 small proof of concept into a distributed, multi-region system.
 
 Read `AGENTS.md` for the target requirements; `README.md` explicitly points to it.
-The repository currently contains documentation only, with no application source,
-package manifest, or configured build, test, or lint tooling. Do not treat the
-target architecture as implemented behavior.
+Those requirements describe the goal, not the current implementation. Check the
+"Implementation phases" table in `README.md` and the chapters in `docs/` to see
+which stages exist; do not treat unimplemented target behavior as present.
 
 ## Staged learning workflow
 
@@ -20,12 +20,38 @@ the entire target system at once.
 - Evolve the repository's Markdown documentation in each stage's PR, not only
   the PR description. Keep it accurate as the implementation changes so a reader
   can eventually understand the system end to end from the documentation alone.
+  Each stage adds a numbered chapter in `docs/` (for example `docs/01-bootstrap.md`),
+  links it from `docs/README.md`, adds new terms to its glossary, and updates the
+  phase table in `README.md`.
 
 ## Commands
 
-No build, test, lint, or single-test commands are defined yet. When tooling is
-introduced, document the actual commands from its configuration here, including
-how to select one test.
+```powershell
+npm run dev               # tsx watch src/server.ts
+npm run build             # tsc -p tsconfig.build.json → dist/
+npm start                 # node dist/server.js
+npm run typecheck         # tsc --noEmit (tsx does not type-check)
+npm run lint              # ESLint with typescript-eslint strictTypeChecked
+npm run format:check      # Prettier
+npm run prisma:generate   # generates src/generated/prisma (gitignored)
+docker compose up -d --wait   # PostgreSQL 18 + Redis 8
+```
+
+No test runner exists yet. When one is added, document how to run a single test here.
+
+## Toolchain constraints
+
+- Native ESM (`"type": "module"`, `NodeNext`): relative imports must use `.js`
+  extensions, and type-only imports need `import type` (`verbatimModuleSyntax`).
+- Dependencies are pinned to exact versions. Use the latest stable releases and
+  avoid deprecated packages; justify any exception in the stage's docs chapter.
+- TypeScript is held at 6.0.x because `typescript-eslint` supports `<6.1`.
+- Prisma 7 reads `DATABASE_URL` through `prisma.config.ts`, not the schema;
+  the `prisma-client` generator outputs to `src/generated/prisma`, and runtime
+  connections use `@prisma/adapter-pg`.
+- Read configuration through the validated `env` object in `src/config/env.ts`,
+  not `process.env`. Keep `createApp()` in `src/app.ts` free of `listen()` so
+  the app can be tested in memory; `src/server.ts` owns the process lifecycle.
 
 ## Target architecture
 
@@ -59,9 +85,8 @@ how to select one test.
 - Supply `.env.example` for server port, database, Redis, WhatsApp, and Azure
   OpenAI configuration. `.gitignore` excludes `.env` and `.env.*` but explicitly
   allows `.env.example`.
-- Local infrastructure is intended to use Docker Compose for PostgreSQL and
-  Redis; persistence changes should include Prisma migrations. ESLint and
-  Prettier are the intended linting and formatting tools.
+- Local infrastructure uses Docker Compose for PostgreSQL and Redis; persistence
+  changes should include Prisma migrations. ESLint and Prettier are configured.
 - As implementation lands, document setup, environment variables, architecture,
   and separate worker startup in `README.md`. Preserve the roadmap toward Azure
   Front Door, Kafka or Event Hubs, multi-region workers, Redis Cluster, and a
