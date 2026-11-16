@@ -5,7 +5,10 @@ and answers `GET /health` with `200 OK`. No WhatsApp, AI, or queue features yet.
 
 This chapter records the bootstrap stage. The current code also includes
 [Phase 1: Webhook Foundation](02-webhook-foundation.md), which adds a required
-verification token, injected dependencies, webhook routes, and error middleware.
+verification token, injected dependencies, webhook routes, and error middleware,
+and [Phase 2: Queue Infrastructure](03-queue-infrastructure.md), which connects
+to Redis, adds a BullMQ queue and a separate worker process, and adds
+correlation IDs.
 
 By the end of this chapter you should understand:
 
@@ -55,8 +58,8 @@ Stage 1 sets all of this up, but only the HTTP part does real work.
 | `pino-http`          | Express middleware that logs every request with Pino.        | Yes       |
 | `@prisma/client`     | Runtime library used by the generated Prisma client.         | Stage 2   |
 | `@prisma/adapter-pg` | Connects Prisma 7 to PostgreSQL using the `pg` driver.       | Stage 2   |
-| `bullmq`             | Job queue stored in Redis; lets workers process jobs later.  | Later     |
-| `redis`              | Redis client, for the conversation cache.                    | Later     |
+| `bullmq`             | Job queue stored in Redis; lets workers process jobs later.  | Phase 2   |
+| `redis`              | Redis client; BullMQ connects through it (cache later).      | Phase 2   |
 | `openai`             | Official SDK; supports Azure OpenAI.                         | Later     |
 | `uuid`               | Generates unique IDs.                                        | Later     |
 | `cors`               | Controls which websites' browsers may call the API.          | Later     |
@@ -189,10 +192,10 @@ secrets are never committed.
    rather than touching `process.env` directly, so all configuration has one
    entry point.
 
-Phase 1 additionally requires a non-empty `WHATSAPP_VERIFY_TOKEN`. Variables for
-later stages (Redis, WhatsApp sending, Azure OpenAI) are listed in
-`.env.example` but are not validated yet; each will be validated in the stage
-that starts using it.
+Phase 1 additionally requires a non-empty `WHATSAPP_VERIFY_TOKEN`, and Phase 2
+validates `REDIS_HOST` and `REDIS_PORT`. Variables for later stages (WhatsApp
+sending, Azure OpenAI) are listed in `.env.example` but are not validated yet;
+each will be validated in the stage that starts using it.
 
 ---
 
@@ -218,8 +221,8 @@ line.
 - Extra context is passed as an object: `logger.info({ port }, 'message')`.
 
 Because each line is JSON, log tools can filter by any field, for example
-"all errors for conversation X". Later stages add `correlationId`, `userId`,
-and `conversationId` to exactly this kind of log line.
+"all errors for conversation X". Phase 2 adds `correlationId`; later stages add
+`userId` and `conversationId` to exactly this kind of log line.
 
 `pino-http` (added in `app.ts`) writes one line per completed request with the
 method, URL path, status code, and response time. Phase 1 removes query strings
@@ -282,8 +285,9 @@ Other details in `app.ts`:
 
 When you press Ctrl+C (`SIGINT`) or a platform stops the app (`SIGTERM`),
 `server.ts` calls `server.close()`. That stops accepting new connections but
-lets in-flight requests finish before the process exits. Later, the same hook
-will close database and Redis connections.
+lets in-flight requests finish before the process exits. Phase 2 extends the
+same hook to close the BullMQ queue and the Redis connection; later stages will
+add the database connection.
 
 ---
 
@@ -406,14 +410,17 @@ What was verified for this stage:
 ## 11. How the project evolves from here
 
 Phase 1 now supplies the webhook controller, runtime validation, centralized
-error middleware, and webhook HTTP tests. Still outside the current implementation:
+error middleware, and webhook HTTP tests. Phase 2 adds the BullMQ queue, a
+separate logging worker, correlation IDs, and Redis integration tests. Still
+outside the current implementation:
 
 - Database models and migrations (`User`, `Conversation`, `Message`).
-- Correlation IDs on every request and in every log line.
-- POST signature authentication and broader database/worker tests.
-- The BullMQ queue and worker, Azure OpenAI provider, and
-  Redis conversation cache.
+- `userId` and `conversationId` in log lines (they need the database).
+- POST signature authentication and database tests.
+- Real worker processing: Azure OpenAI provider, Redis conversation cache, and
+  the WhatsApp sending placeholder.
 - The health response's final shape, which will add
   `"service": "whatsapp-ai-assistant"`.
 
-**Next:** [Chapter 2 — Webhook Foundation (Phase 1)](02-webhook-foundation.md).
+**Next:** [Chapter 2 — Webhook Foundation (Phase 1)](02-webhook-foundation.md),
+then [Chapter 3 — Queue Infrastructure (Phase 2)](03-queue-infrastructure.md).

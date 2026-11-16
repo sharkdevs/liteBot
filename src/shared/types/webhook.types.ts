@@ -18,4 +18,7 @@ export interface WebhookChange {
 export interface Message {
   id: string;
   from?: string;
+  type?: string;
+  text?: { body: string };
+  timestamp?: string;
 }

@@ -25,6 +25,26 @@ function parseMessage(input: unknown): Message {
     }
     message.from = input.from;
   }
+  if ('type' in input) {
+    if (!isNonEmptyString(input.type)) {
+      throw new BadRequestError('A message type must be a non-empty string when provided');
+    }
+    message.type = input.type;
+  }
+  if (message.type === 'text') {
+    if (!isRecord(input.text) || !isNonEmptyString(input.text.body)) {
+      throw new BadRequestError('A text message must have a non-empty text body');
+    }
+    if (
+      typeof input.timestamp !== 'string' ||
+      !/^\d+$/.test(input.timestamp) ||
+      !Number.isSafeInteger(Number(input.timestamp))
+    ) {
+      throw new BadRequestError('A text message timestamp must be a Unix-seconds string');
+    }
+    message.text = { body: input.text.body };
+    message.timestamp = input.timestamp;
+  }
   return message;
 }
 
@@ -54,7 +74,7 @@ function parseEntry(input: unknown): WebhookEntry {
   return { id: input.id, changes: input.changes.map(parseChange) };
 }
 
-// Construct an allow-listed projection: unmodeled payload fields never reach the logs.
+// Validate the full batch before any message can be enqueued.
 export function parseWebhookPayload(input: unknown): WebhookPayload {
   if (
     !isRecord(input) ||
