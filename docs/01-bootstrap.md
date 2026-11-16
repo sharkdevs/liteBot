@@ -70,9 +70,10 @@ Stage 1 sets all of this up, but only the HTTP part does real work.
 
 ### Version choices
 
-Every package is the latest stable release, pinned exactly (no `^`) so that
-`npm install` produces the same result for everyone. Three deliberate
-exceptions or changes from the original request:
+Direct dependencies use stable versions checked on 2026-11-16 and are pinned
+exactly (no `^`). `package-lock.json` also records transitive dependencies
+(packages used by our dependencies); `npm ci` installs that locked tree.
+Three deliberate exceptions or changes from the original request:
 
 1. **TypeScript 6.0.3, not 7.0.2.** `typescript-eslint` 8.72.2, the latest,
    supports TypeScript below 6.1. Choosing 7 would mean dropping typed linting.
@@ -85,8 +86,24 @@ exceptions or changes from the original request:
 
 **Known deprecation warning:** `npm install` reports `node-abort-controller`
 as deprecated. It is a dependency of BullMQ 6.7.6 (the latest), which imports
-it directly, so we cannot remove it without patching BullMQ. It is harmless on
-modern Node.js and will disappear when BullMQ drops it.
+it directly. All direct dependencies are non-deprecated, but the complete tree
+is **not deprecation-free**. Retaining the requested current BullMQ version
+retains this upstream warning; we have not patched or hidden it.
+
+**Audit result:** `npm audit --omit=dev` reports zero runtime vulnerabilities.
+The full `npm audit` reports seven moderate entries stemming from a single
+[minimatch advisory](https://github.com/advisories/GHSA-g3hv-75wg-m249) in the
+typescript-eslint dependency chain. These are not seven separate flaws.
+The affected code handles glob-pattern preprocessing, not HTTP requests.
+In this repository the parser receives the fixed `eslint.config.js` pattern
+from our lint configuration and does not enable the affected optimization mode.
+The advisory is deferred for this development-only use; no high or critical
+findings were reported. We have not forced a major-version override or downgraded
+the agreed lint toolchain just to remove the warning. Recheck on 2026-11-23 or
+when typescript-eslint publishes a compatible fix, whichever is first.
+
+Node.js must satisfy `^22.13.0 || >=24.0.0`. Although Prisma supports 22.12,
+ESLint requires at least 22.13 on Node 22.
 
 ---
 
@@ -118,7 +135,7 @@ deprecated for modern Node.js and does not understand ES modules correctly.)
 ### Two TypeScript configurations
 
 - **`tsconfig.json`** — used by your editor, `npm run typecheck`, and ESLint.
-  It checks `src/` and `prisma.config.ts`, and never writes files (`noEmit`).
+  It checks `src/`, `tests/`, and `prisma.config.ts`, and never writes files (`noEmit`).
 - **`tsconfig.build.json`** — used by `npm run build`. It extends the first
   file, then sets `rootDir: src` and `outDir: dist`, so `src/app.ts` becomes
   `dist/app.js`.
@@ -233,6 +250,15 @@ Why are `app.ts` and `server.ts` separate?
   stages can test the app in memory.
 - **`server.ts`** _runs_ it: opens the port, logs start-up, and handles shutdown.
 
+### Startup failures
+
+An occupied port is not a successful startup. In
+[Express 5](https://expressjs.com/en/guide/migrating-5/#applisten), `listen()`
+passes binding errors to its callback. `server.ts` checks that argument, logs
+the error through Pino, and sets exit code `1` instead of claiming to be listening.
+An exit code of `0` means success to a shell or process supervisor, so this
+distinction matters even for a minimal server.
+
 Other details in `app.ts`:
 
 - `app.disable('x-powered-by')` removes a header advertising Express, which
@@ -270,6 +296,9 @@ and waits until they are healthy.
   service is actually ready, not merely started.
 - The PostgreSQL user, password, and database are all `litebot`. These are
   development-only credentials and match `DATABASE_URL` in `.env.example`.
+- Port mappings bind to `127.0.0.1`, so these local services are not published
+  to other computers on the network. Do not use this unauthenticated Redis or
+  the example PostgreSQL password for a deployment.
 
 ---
 
@@ -309,10 +338,23 @@ At runtime (from Stage 2), the app will connect using a **driver adapter**,
 
 ## 10. Verify it yourself
 
+Two focused tests use Node's built-in test runner, with `tsx` loading TypeScript:
+
+```powershell
+npm test
+node --import tsx --test --test-name-pattern="occupied port" tests/bootstrap.test.ts
+```
+
+The health test opens an ephemeral (OS-selected) port and checks the exact
+Stage 1 response. The startup test reserves a port, starts a second process
+on that port, and requires an error log and exit code `1`. It failed before
+the startup fix because the process exited successfully. Both tests clean up
+their listeners and need no database, Redis, or external API credentials.
+
 With Docker Desktop running:
 
 ```powershell
-npm install
+npm ci
 Copy-Item .env.example .env
 docker compose up -d --wait
 npm run prisma:generate
@@ -324,21 +366,29 @@ In another terminal:
 
 ```powershell
 curl http://localhost:3000/health          # → {"status":"healthy"}
-npx prisma migrate status                  # connects; reports no migrations yet
 docker compose exec redis redis-cli ping   # → PONG
+docker compose exec postgres pg_isready -U litebot -d litebot
 ```
+
+`npx prisma migrate status` can also confirm connectivity, but an empty schema
+with no migration history reports an unmanaged database and exits nonzero.
+That is expected in Stage 1; it is not a passing migration check. Do not create
+a dummy model or migration to silence it.
 
 What was verified for this stage:
 
-| Check                         | Result                                       |
-| ----------------------------- | -------------------------------------------- |
-| `npm install`                 | Succeeded; 0 vulnerabilities                 |
-| `docker compose up --wait`    | `postgres` and `redis` healthy               |
-| `npm run prisma:generate`     | Client generated to `src/generated/prisma`   |
-| `npx prisma migrate status`   | Connected to PostgreSQL; no migrations yet   |
-| typecheck, lint, format       | All pass                                     |
-| `npm run build` + `npm start` | `GET /health` → `200 {"status":"healthy"}`   |
-| `npm run dev`                 | `GET /health` → `200`; unknown route → `404` |
+| Check                         | Result                                                       |
+| ----------------------------- | ------------------------------------------------------------ |
+| `npm ci`                      | Succeeded; see dependency warnings above                     |
+| `npm audit --omit=dev`        | Zero runtime vulnerabilities                                 |
+| `npm audit`                   | Seven moderate dev-tool entries; deferred as explained above |
+| `npm test`                    | Health and occupied-port regression tests pass               |
+| `docker compose up --wait`    | `postgres` and `redis` healthy                               |
+| `npm run prisma:generate`     | Client generated to `src/generated/prisma`                   |
+| `pg_isready` / Redis `ping`   | PostgreSQL accepts connections; Redis returns `PONG`         |
+| typecheck, lint, format       | All pass                                                     |
+| `npm run build` + `npm start` | `GET /health` → `200 {"status":"healthy"}`                   |
+| `npm run dev`                 | `GET /health` → `200`; unknown route → `404`                 |
 
 ---
 
@@ -349,7 +399,7 @@ Each item has a `TODO` in the code or an empty folder kept with `.gitkeep`:
 - Database models and migrations (`User`, `Conversation`, `Message`).
 - Correlation IDs on every request and in every log line.
 - Centralised error middleware with a consistent JSON error format.
-- An automated test runner and HTTP tests.
+- Broader HTTP, database, and worker tests beyond the bootstrap smoke tests.
 - The WhatsApp webhook, BullMQ queue and worker, Azure OpenAI provider, and
   Redis conversation cache.
 - The health response's final shape, which will add

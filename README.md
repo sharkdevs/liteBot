@@ -49,25 +49,26 @@ the slow work happens elsewhere. The two can also be scaled independently.
 
 ## Tech stack
 
-| Concern         | Choice                                   |
-| --------------- | ---------------------------------------- |
-| Runtime         | Node.js 22.12+ (native ES modules)       |
-| Language        | TypeScript 6 (strict)                    |
-| HTTP framework  | Express 5                                |
-| Database        | PostgreSQL 18, accessed through Prisma 7 |
-| Queue and cache | Redis 8 with BullMQ                      |
-| AI              | Azure OpenAI via the `openai` SDK        |
-| Logging         | Pino and pino-http                       |
-| Local services  | Docker Compose                           |
-| Code quality    | ESLint (typed rules) and Prettier        |
+| Concern         | Choice                                             |
+| --------------- | -------------------------------------------------- |
+| Runtime         | Node.js 22.13+ on 22.x, or 24+ (native ES modules) |
+| Language        | TypeScript 6 (strict)                              |
+| HTTP framework  | Express 5                                          |
+| Database        | PostgreSQL 18, accessed through Prisma 7           |
+| Queue and cache | Redis 8 with BullMQ                                |
+| AI              | Azure OpenAI via the `openai` SDK                  |
+| Logging         | Pino and pino-http                                 |
+| Local services  | Docker Compose                                     |
+| Code quality    | ESLint (typed rules) and Prettier                  |
 
 ## Local setup
 
-**Prerequisites:** Node.js 22.12 or newer, npm, and Docker Desktop (running).
+**Prerequisites:** Node.js 22.13+ on the 22.x release line, or Node.js 24+, npm,
+and Docker Desktop (running). The minimum matches ESLint's supported Node versions.
 
 ```powershell
 # 1. Install dependencies
-npm install
+npm ci
 
 # 2. Create your local environment file
 Copy-Item .env.example .env        # macOS/Linux: cp .env.example .env
@@ -90,21 +91,35 @@ curl http://localhost:3000/health
 ```
 
 Stop the services with `docker compose down` (add `-v` to delete their data).
+Their default ports are published only on `127.0.0.1`; the example database
+credentials and unauthenticated Redis are for local development, not deployment.
+
+See the [dependency notes](docs/01-bootstrap.md#version-choices) for the agreed
+version exceptions, BullMQ's transitive deprecation warning, and a deferred
+development-only lint dependency advisory.
 
 ## Commands
 
-| Command                   | What it does                                       |
-| ------------------------- | -------------------------------------------------- |
-| `npm run dev`             | Run `src/server.ts` with tsx, restarting on change |
-| `npm run build`           | Compile `src/` to JavaScript in `dist/`            |
-| `npm start`               | Run the compiled server from `dist/`               |
-| `npm run typecheck`       | Type-check without writing files                   |
-| `npm run lint`            | Run ESLint                                         |
-| `npm run format`          | Format all files with Prettier                     |
-| `npm run format:check`    | Report formatting problems without changing files  |
-| `npm run prisma:generate` | Generate the Prisma client into `src/generated/`   |
+| Command                   | What it does                                                                 |
+| ------------------------- | ---------------------------------------------------------------------------- |
+| `npm run dev`             | Run `src/server.ts` with tsx, restarting on change                           |
+| `npm run build`           | Compile `src/` to JavaScript in `dist/`                                      |
+| `npm start`               | Run the compiled server from `dist/`                                         |
+| `npm run typecheck`       | Type-check without writing files                                             |
+| `npm test`                | Run the bootstrap smoke and startup regression tests with Node's test runner |
+| `npm run lint`            | Run ESLint                                                                   |
+| `npm run format`          | Format all files with Prettier                                               |
+| `npm run format:check`    | Report formatting problems without changing files                            |
+| `npm run prisma:generate` | Generate the Prisma client into `src/generated/`                             |
 
-No test runner exists yet; one arrives with the first stage that adds behaviour.
+To run only the startup regression test:
+
+```powershell
+node --import tsx --test --test-name-pattern="occupied port" tests/bootstrap.test.ts
+```
+
+These two tests require neither PostgreSQL nor Redis. Broader tests arrive with
+the later stages.
 
 ## Environment variables
 
@@ -166,8 +181,8 @@ boundaries above are what let it grow:
   delivery outgrows a single Redis.
 - **Multi-region workers** consume from the shared event stream.
 - **Redis Cluster** shards caching and coordination.
-- **A globally distributed database** (for example Azure Cosmos DB for
-  PostgreSQL or a similar service) replaces the single PostgreSQL instance.
+- **A globally distributed database** replaces the single PostgreSQL instance;
+  the choice will depend on consistency, residency, and latency requirements.
 
 Each step will be explained in the learning guide when we reach it.
 

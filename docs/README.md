@@ -27,5 +27,6 @@ Terms are added here as chapters introduce them.
 | Middleware      | A function that runs on every request before (or after) the route handler.                    |
 | ORM             | Object–relational mapper: a library that lets code query a database using objects (Prisma).   |
 | Structured log  | A log line written as JSON fields rather than free text, so tools can search and filter it.   |
+| Regression test | A test that reproduces a bug and guards against bringing it back in a later change.           |
 | Transpile       | Convert source code from one language to another, here TypeScript to JavaScript.              |
 | Webhook         | A URL that another service calls to tell us something happened (Meta calls ours on messages). |

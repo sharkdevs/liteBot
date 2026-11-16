@@ -31,16 +31,19 @@ npm run dev               # tsx watch src/server.ts
 npm run build             # tsc -p tsconfig.build.json → dist/
 npm start                 # node dist/server.js
 npm run typecheck         # tsc --noEmit (tsx does not type-check)
+npm test                  # Node's built-in runner, using tsx for TypeScript
+node --import tsx --test --test-name-pattern="occupied port" tests/bootstrap.test.ts
 npm run lint              # ESLint with typescript-eslint strictTypeChecked
 npm run format:check      # Prettier
 npm run prisma:generate   # generates src/generated/prisma (gitignored)
 docker compose up -d --wait   # PostgreSQL 18 + Redis 8
 ```
 
-No test runner exists yet. When one is added, document how to run a single test here.
+The bootstrap tests in `tests/bootstrap.test.ts` need no database or Redis.
 
 ## Toolchain constraints
 
+- Supported Node versions are `^22.13.0 || >=24.0.0`, matching the lint toolchain.
 - Native ESM (`"type": "module"`, `NodeNext`): relative imports must use `.js`
   extensions, and type-only imports need `import type` (`verbatimModuleSyntax`).
 - Dependencies are pinned to exact versions. Use the latest stable releases and
@@ -74,8 +77,8 @@ No test runner exists yet. When one is added, document how to run a single test 
 
 ## Project-specific contracts
 
-- `GET /health` must return
-  `{"status":"healthy","service":"whatsapp-ai-assistant"}`.
+- Stage 1's `GET /health` returns exactly `{"status":"healthy"}`.
+  The target in `AGENTS.md` adds `"service":"whatsapp-ai-assistant"` in a later stage.
 - `GET /webhook` must support Meta verification using an environment-provided
   verification token; `POST /webhook` follows the asynchronous flow above.
 - Attach an `x-correlation-id` to every request. Use Pino and include
