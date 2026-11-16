@@ -13,6 +13,7 @@ export interface WorkerEnv {
 export interface Env extends WorkerEnv {
   readonly port: number;
   readonly whatsappVerifyToken: string;
+  readonly databaseUrl: string;
 }
 
 function parsePort(value: string | undefined, name: string, defaultPort: number): number {
@@ -38,6 +39,15 @@ function parseVerifyToken(value: string | undefined): string {
   return value;
 }
 
+// The error never repeats the value, because a connection string contains a password.
+function parseDatabaseUrl(value: string | undefined): string {
+  const protocol = value?.trim() ? URL.parse(value)?.protocol : undefined;
+  if (value === undefined || (protocol !== 'postgresql:' && protocol !== 'postgres:')) {
+    throw new Error('DATABASE_URL must be a postgresql:// connection string');
+  }
+  return value;
+}
+
 export function loadWorkerEnv(source: NodeJS.ProcessEnv = process.env): WorkerEnv {
   const host = source.REDIS_HOST ?? 'localhost';
   if (!host.trim()) {
@@ -57,7 +67,8 @@ export function loadApiEnv(source: NodeJS.ProcessEnv = process.env): Env {
     port: parsePort(source.PORT, 'PORT', 3000),
     whatsappVerifyToken: parseVerifyToken(source.WHATSAPP_VERIFY_TOKEN),
     ...loadWorkerEnv(source),
+    databaseUrl: parseDatabaseUrl(source.DATABASE_URL),
   });
 }
 
-// TODO(later stages): validate database, WhatsApp sending, and AI settings when used.
+// TODO(later stages): validate WhatsApp sending and AI settings when used.

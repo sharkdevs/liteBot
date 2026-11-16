@@ -10,4 +10,51 @@ datasource db {
   provider = "postgresql"
 }
 
-// TODO(stage 2): add User, Conversation, and Message models plus the first migration.
+// Model names and fields are camelCase in TypeScript; @map/@@map give the
+// PostgreSQL tables and columns conventional snake_case names.
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+
+  @@map("message_direction")
+}
+
+model User {
+  id            String         @id @default(uuid(7)) @db.Uuid
+  phoneNumber   String         @unique @map("phone_number")
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  conversations Conversation[]
+
+  @@map("users")
+}
+
+model Conversation {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  user      User      @relation(fields: [userId], references: [id])
+  messages  Message[]
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  // Serves "latest conversation for a user" and the user_id foreign key.
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("conversations")
+}
+
+model Message {
+  id                String           @id @default(uuid(7)) @db.Uuid
+  conversationId    String           @map("conversation_id") @db.Uuid
+  conversation      Conversation     @relation(fields: [conversationId], references: [id])
+  // Meta's ID for the message. Unique, so a redelivered webhook cannot store it
+  // twice; optional, because an outbound reply only gets one after it is sent.
+  whatsappMessageId String?          @unique @map("whatsapp_message_id")
+  direction         MessageDirection
+  content           String
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  // Serves "messages in a conversation, oldest first" and the conversation_id foreign key.
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
