@@ -174,7 +174,15 @@ Stop API/AI processes before applying the migration, then:
 docker compose up -d --wait
 npm run prisma:generate
 npm run prisma:migrate:deploy
+npx prisma migrate status
 ```
+
+Confirm all migrations are applied to the **same database used by the running
+processes** before testing a webhook. Restarting the API, generating Prisma
+Client, or getting a healthy `/health` response does not migrate PostgreSQL.
+If the new code reports `P2022` / `messages.status does not exist`, the Phase 5
+migration has not reached that database. `/health` is liveness, not schema
+readiness.
 
 In the existing uncommitted `.env`, set `WHATSAPP_ACCESS_TOKEN` and
 `WHATSAPP_PHONE_NUMBER_ID`. The latter is Meta's **numeric business phone number
