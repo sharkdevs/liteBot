@@ -8,6 +8,7 @@ import {
 import type { IncomingMessageJob } from '../shared/types/incoming-message-job.js';
 
 type MessageJob = Job<IncomingMessageJob, void, typeof INCOMING_MESSAGE_JOB_NAME>;
+export type MessageProcessor = (job: IncomingMessageJob) => Promise<void>;
 
 function logContext(job: MessageJob) {
   const { correlationId, userId, conversationId, messageId, whatsappMessageId, phoneNumber } =
@@ -26,6 +27,7 @@ function logContext(job: MessageJob) {
 export function createMessageWorker(
   connection: IRedisClient,
   logger: Logger,
+  processMessage: MessageProcessor,
   options: Pick<WorkerOptions, 'prefix'> = {},
 ): Worker<IncomingMessageJob, void, typeof INCOMING_MESSAGE_JOB_NAME> {
   const worker = new Worker<IncomingMessageJob, void, typeof INCOMING_MESSAGE_JOB_NAME>(
@@ -40,7 +42,7 @@ export function createMessageWorker(
         { ...context, payload: { ...job.data, messageText: '[Redacted]' } },
         'Incoming message payload received',
       );
-      return Promise.resolve();
+      return processMessage(job.data);
     },
     { ...options, connection },
   );

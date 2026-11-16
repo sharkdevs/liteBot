@@ -27,6 +27,8 @@ const savedMessage: IConversationService = {
       messageId: message.messageId,
       duplicate: false,
     }),
+  getRecentMessages: () => Promise.resolve([]),
+  saveOutboundMessage: () => Promise.reject(new Error('Queue tests must not save replies')),
 };
 
 function webhookBody() {

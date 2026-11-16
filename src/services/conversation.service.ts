@@ -1,7 +1,7 @@
 import type { Logger } from 'pino';
 
 import { WhatsappMessageIdConflictError } from '../domain/message/message-id-conflict.error.js';
-import { MessageDirection } from '../domain/message/message.js';
+import { MessageDirection, type Message } from '../domain/message/message.js';
 import type { IUnitOfWork } from '../repositories/unit-of-work.js';
 
 export interface InboundTextMessage {
@@ -25,6 +25,12 @@ export interface RecordedInboundMessage {
 
 export interface IConversationService {
   recordInboundMessage(message: InboundTextMessage): Promise<RecordedInboundMessage>;
+  getRecentMessages(
+    conversationId: string,
+    limit: number,
+    excludeMessageId?: string,
+  ): Promise<Message[]>;
+  saveOutboundMessage(conversationId: string, content: string): Promise<Message>;
 }
 
 export class ConversationService implements IConversationService {
@@ -105,5 +111,21 @@ export class ConversationService implements IConversationService {
     }
 
     return { userId, conversationId, messageId: message.id, duplicate: saved.duplicate };
+  }
+
+  getRecentMessages(
+    conversationId: string,
+    limit: number,
+    excludeMessageId?: string,
+  ): Promise<Message[]> {
+    return this.unitOfWork.run(({ messages }) =>
+      messages.findRecentMessagesByConversation(conversationId, limit, excludeMessageId),
+    );
+  }
+
+  saveOutboundMessage(conversationId: string, content: string): Promise<Message> {
+    return this.unitOfWork.run(({ messages }) =>
+      messages.saveOutboundMessage(conversationId, content),
+    );
   }
 }

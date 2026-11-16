@@ -13,7 +13,7 @@ import { IncomingMessageQueue } from '../../src/queues/message.queue.js';
 import { INCOMING_MESSAGE_QUEUE_NAME } from '../../src/queues/queue.constants.js';
 import type { IConversationService } from '../../src/services/conversation.service.js';
 import type { IncomingMessageJob } from '../../src/shared/types/incoming-message-job.js';
-import { createMessageWorker } from '../../src/workers/message.worker.js';
+import { createMessageWorker, type MessageProcessor } from '../../src/workers/message.worker.js';
 
 /** A queue under a unique Redis key prefix, removed after the test, plus captured logs. */
 export async function setupQueue(t: TestContext) {
@@ -75,10 +75,10 @@ export async function setupQueue(t: TestContext) {
     logs,
     connection,
     settings,
-    startWorker: () => {
+    startWorker: (processMessage: MessageProcessor = () => Promise.resolve()) => {
       const client = createRedisConnection(settings, logger, 'worker');
       workerConnections.push(client);
-      const worker = createMessageWorker(client, logger, { prefix });
+      const worker = createMessageWorker(client, logger, processMessage, { prefix });
       workers.push(worker);
       return worker;
     },

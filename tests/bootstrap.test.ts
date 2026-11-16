@@ -37,6 +37,8 @@ await test('health returns the Stage 1 response without database or Redis connec
     whatsappVerifyToken: 'test-verification-token',
     conversationService: {
       recordInboundMessage: () => Promise.reject(new Error('Health requests must not save data')),
+      getRecentMessages: () => Promise.resolve([]),
+      saveOutboundMessage: () => Promise.reject(new Error('Health requests must not save data')),
     },
     incomingMessageQueue: {
       enqueue: () => Promise.reject(new Error('Health requests must not enqueue jobs')),
@@ -125,6 +127,10 @@ await test(
           WHATSAPP_VERIFY_TOKEN: '',
           REDIS_HOST: '127.0.0.1',
           REDIS_PORT: String(address.port),
+          DATABASE_URL: 'postgresql://test:test@127.0.0.1:5432/litebot',
+          AI_PROVIDER: 'azure-foundry',
+          AZURE_AI_FOUNDRY_ENDPOINT: 'https://foundry.example.com/openai/v1/',
+          AZURE_AI_FOUNDRY_API_KEY: 'synthetic-key',
         },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       },

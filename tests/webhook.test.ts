@@ -53,6 +53,8 @@ async function startApp(t: TestContext, overrides: AppOverrides = {}) {
         duplicate: false,
       });
     },
+    getRecentMessages: () => Promise.resolve([]),
+    saveOutboundMessage: () => Promise.reject(new Error('Webhook tests must not save replies')),
   };
   const server = createApp({
     logger,
@@ -344,6 +346,8 @@ await test('POST returns 500 and enqueues nothing when saving a message fails', 
   const { url, jobs, logs } = await startApp(t, {
     conversationService: {
       recordInboundMessage: () => Promise.reject(new Error('PRIVATE_DATABASE_FAILURE')),
+      getRecentMessages: () => Promise.resolve([]),
+      saveOutboundMessage: () => Promise.reject(new Error('Webhook tests must not save replies')),
     },
   });
   const response = await fetch(url, {
