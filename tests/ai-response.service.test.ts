@@ -6,7 +6,8 @@ import { pino } from 'pino';
 import type { IAiProvider } from '../src/providers/ai/index.js';
 import type { Message } from '../src/domain/message/message.js';
 import type { IncomingMessageJob } from '../src/shared/types/incoming-message-job.js';
-import type { IConversationService } from '../src/services/conversation.service.js';
+import type { IAiConversationService } from '../src/services/conversation.service.js';
+import type { OutgoingMessageJob } from '../src/shared/types/outgoing-message-job.js';
 import { AiResponseService } from '../src/services/ai-response.service.js';
 
 const job: IncomingMessageJob = {
@@ -57,7 +58,9 @@ await test('AI response is generated, persisted, and logged without logging its 
   const savedMessages: Array<{ conversationId: string; content: string }> = [];
   let receivedHistory: Message[] = [];
   let receivedUserMessage = '';
-  const conversationService: IConversationService = {
+  const outgoing: OutgoingMessageJob[] = [];
+  const conversationService: IAiConversationService = {
+    findReplyToMessage: () => Promise.resolve(null),
     recordInboundMessage: () => Promise.reject(new Error('Unexpected inbound write')),
     getRecentMessages: (conversationId, limit, excludeMessageId) => {
       assert.equal(conversationId, job.conversationId);
@@ -92,12 +95,28 @@ await test('AI response is generated, persisted, and logged without logging its 
     },
   };
 
-  await new AiResponseService(conversationService, provider, 'phi-4-mini', logger).process(job);
+  await new AiResponseService(conversationService, provider, 'phi-4-mini', logger, {
+    enqueue: (data) => {
+      assert.equal(savedMessages.length, 1, 'Persist before queue publication');
+      outgoing.push(data);
+      return Promise.resolve();
+    },
+  }).process(job);
 
   assert.equal(receivedUserMessage, job.messageText);
   assert.deepEqual(receivedHistory, history);
   assert.deepEqual(savedMessages, [
     { conversationId: job.conversationId, content: 'Private generated response' },
+  ]);
+  assert.deepEqual(outgoing, [
+    {
+      phoneNumber: job.phoneNumber,
+      conversationId: job.conversationId,
+      messageId: 'outbound-message-id',
+      content: 'Private generated response',
+      correlationId: job.correlationId,
+      userId: job.userId,
+    },
   ]);
   const log = JSON.parse(logs.at(-1) ?? '{}') as Record<string, unknown>;
   assert.equal(log.correlationId, job.correlationId);
@@ -115,7 +134,8 @@ await test('AI response is generated, persisted, and logged without logging its 
 
 await test('AI provider failures propagate without persisting an outbound message', async () => {
   let outboundSaveAttempted = false;
-  const conversationService: IConversationService = {
+  const conversationService: IAiConversationService = {
+    findReplyToMessage: () => Promise.resolve(null),
     recordInboundMessage: () => Promise.reject(new Error('Unexpected inbound write')),
     getRecentMessages: () => Promise.resolve(history),
     saveOutboundMessage: () => {
@@ -126,8 +146,79 @@ await test('AI provider failures propagate without persisting an outbound messag
   const provider: IAiProvider = {
     generateResponse: () => Promise.reject(new Error('Synthetic provider failure')),
   };
-  const service = new AiResponseService(conversationService, provider, 'phi-4-mini', pino());
+  const service = new AiResponseService(conversationService, provider, 'phi-4-mini', pino(), {
+    enqueue: () => Promise.reject(new Error('Unexpected enqueue')),
+  });
 
   await assert.rejects(service.process(job), /Synthetic provider failure/);
   assert.equal(outboundSaveAttempted, false);
+});
+
+await test('publication failure retries the saved reply without another AI call or database row', async () => {
+  let saved: Message | null = null;
+  let generations = 0;
+  let publications = 0;
+  const conversationService: IAiConversationService = {
+    recordInboundMessage: () => Promise.reject(new Error('Unexpected inbound write')),
+    getRecentMessages: () => Promise.resolve([]),
+    findReplyToMessage: () => Promise.resolve(saved),
+    saveOutboundMessage: (conversationId, content, replyToMessageId) => {
+      assert.equal(replyToMessageId, job.messageId);
+      assert.equal(saved, null);
+      saved = {
+        id: 'stable-reply-id',
+        conversationId,
+        content,
+        replyToMessageId: job.messageId,
+        direction: 'OUTBOUND',
+        status: 'PENDING',
+        whatsappMessageId: null,
+        createdAt: new Date(),
+      };
+      return Promise.resolve(saved);
+    },
+  };
+  const service = new AiResponseService(
+    conversationService,
+    {
+      generateResponse: () => {
+        generations++;
+        return Promise.resolve('Private reply');
+      },
+    },
+    'synthetic-model',
+    pino({ level: 'silent' }),
+    {
+      enqueue: (outgoing) => {
+        publications++;
+        assert.equal(outgoing.messageId, 'stable-reply-id');
+        if (publications === 1) return Promise.reject(new Error('Redis unavailable'));
+        return Promise.resolve();
+      },
+    },
+  );
+  await assert.rejects(service.process(job), /Redis unavailable/);
+  await service.process(job);
+  assert.equal(generations, 1);
+  assert.equal(publications, 2);
+});
+
+await test('a failed outbound save prevents queue publication', async () => {
+  const service = new AiResponseService(
+    {
+      recordInboundMessage: () => Promise.reject(new Error('Unexpected inbound write')),
+      findReplyToMessage: () => Promise.resolve(null),
+      getRecentMessages: () => Promise.resolve([]),
+      saveOutboundMessage: () => Promise.reject(new Error('Database unavailable')),
+    },
+    { generateResponse: () => Promise.resolve('Private reply') },
+    'synthetic-model',
+    pino({ level: 'silent' }),
+    {
+      enqueue: () => {
+        assert.fail('Unsaved replies must not be queued');
+      },
+    },
+  );
+  await assert.rejects(service.process(job), /Database unavailable/);
 });

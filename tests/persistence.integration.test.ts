@@ -492,6 +492,7 @@ await test('persistence layer', async (t) => {
         provider,
         'phi-4-mini',
         fixture.logger,
+        fixture.outgoingQueue,
       );
       const worker = fixture.startWorker((incomingJob) => aiResponseService.process(incomingJob));
       await once(worker, 'completed', { signal: AbortSignal.timeout(10_000) });
@@ -517,6 +518,16 @@ await test('persistence layer', async (t) => {
         },
       });
       assert.equal(savedResponse.whatsappMessageId, null);
+      assert.equal(savedResponse.status, 'PENDING');
+      const outgoing = await fixture.outgoingInspector.getJob(savedResponse.id);
+      assert.equal(outgoing?.data.content, savedResponse.content);
+      assert.equal(outgoing.data.phoneNumber, phoneNumber);
+      assert.equal(outgoing.data.correlationId, 'e2e-correlation');
+      assert.equal(
+        await outgoing.getState(),
+        'waiting',
+        'AI completion does not wait for transport',
+      );
 
       // Meta retries a delivery it thinks failed: nothing new is saved or queued.
       assert.equal((await post()).status, 200);

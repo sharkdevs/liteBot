@@ -208,3 +208,23 @@ await test(
     assert.doesNotMatch(output, /Incoming message processing completed/);
   },
 );
+await test('outgoing publication deduplicates the saved reply ID and fails promptly offline', async (t) => {
+  const { outgoingQueue, outgoingInspector, connection, logs } = await setupQueue(t);
+  const outgoing = {
+    phoneNumber: '15550000001',
+    conversationId: 'conversation-outgoing',
+    messageId: 'message-outgoing',
+    content: 'PRIVATE_OUTBOUND_CONTENT',
+    correlationId: 'outgoing-correlation',
+    userId: 'user-outgoing',
+  };
+  await outgoingQueue.enqueue(outgoing);
+  await outgoingQueue.enqueue(outgoing);
+  assert.equal(await outgoingInspector.getWaitingCount(), 1);
+  const saved = await outgoingInspector.getJob(outgoing.messageId);
+  assert.equal(saved?.opts.attempts, 3);
+  assert.deepEqual(saved.opts.backoff, { type: 'exponential', delay: 1000 });
+  assert.doesNotMatch(logs.join(''), /PRIVATE_OUTBOUND_CONTENT/);
+  connection.disconnect();
+  await assert.rejects(outgoingQueue.enqueue({ ...outgoing, messageId: 'offline' }), /not ready/);
+});

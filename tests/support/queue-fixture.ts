@@ -10,7 +10,12 @@ import { pino } from 'pino';
 import { createApp } from '../../src/app.js';
 import { createRedisConnection } from '../../src/config/redis.js';
 import { IncomingMessageQueue } from '../../src/queues/message.queue.js';
-import { INCOMING_MESSAGE_QUEUE_NAME } from '../../src/queues/queue.constants.js';
+import { OutgoingMessageQueue } from '../../src/queues/outgoing-message.queue.js';
+import {
+  INCOMING_MESSAGE_QUEUE_NAME,
+  OUTGOING_MESSAGE_QUEUE_NAME,
+} from '../../src/queues/queue.constants.js';
+import type { OutgoingMessageJob } from '../../src/shared/types/outgoing-message-job.js';
 import type { IConversationService } from '../../src/services/conversation.service.js';
 import type { IncomingMessageJob } from '../../src/shared/types/incoming-message-job.js';
 import { createMessageWorker, type MessageProcessor } from '../../src/workers/message.worker.js';
@@ -52,13 +57,24 @@ export async function setupQueue(t: TestContext) {
     connection: inspectionConnection,
     prefix,
   });
+  const outgoingQueue = new OutgoingMessageQueue(connection, logger, { prefix });
+  const outgoingInspector = new Queue<OutgoingMessageJob>(OUTGOING_MESSAGE_QUEUE_NAME, {
+    connection: inspectionConnection,
+    prefix,
+  });
   const workers: ReturnType<typeof createMessageWorker>[] = [];
   const workerConnections: ReturnType<typeof createRedisConnection>[] = [];
   t.after(async () => {
     try {
       await Promise.all(workers.map((worker) => worker.close()));
       await inspector.obliterate();
-      await Promise.all([queue.close(), inspector.close()]);
+      await outgoingInspector.obliterate();
+      await Promise.all([
+        queue.close(),
+        inspector.close(),
+        outgoingQueue.close(),
+        outgoingInspector.close(),
+      ]);
     } finally {
       connection.disconnect();
       inspectionConnection.disconnect();
@@ -68,8 +84,12 @@ export async function setupQueue(t: TestContext) {
     }
   });
   await inspector.waitUntilReady();
+  await outgoingInspector.waitUntilReady();
   return {
     queue,
+    outgoingQueue,
+    outgoingInspector,
+    prefix,
     inspector,
     logger,
     logs,
