@@ -1,8 +1,8 @@
-import { pino } from 'pino';
+import { pino, type LevelWithSilent, type Logger } from 'pino';
 
-import { env } from './env.js';
-
-export const logger = pino({
-  level: env.logLevel,
-  base: { service: 'whatsapp-ai-assistant' },
-});
+export function createLogger(level: LevelWithSilent): Logger {
+  return pino({
+    level,
+    base: { service: 'whatsapp-ai-assistant' },
+  });
+}

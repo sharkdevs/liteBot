@@ -3,6 +3,10 @@
 **Goal of this stage:** create a clean foundation that installs, compiles, runs,
 and answers `GET /health` with `200 OK`. No WhatsApp, AI, or queue features yet.
 
+This chapter records the bootstrap stage. The current code also includes
+[Phase 1: Webhook Foundation](02-webhook-foundation.md), which adds a required
+verification token, injected dependencies, webhook routes, and error middleware.
+
 By the end of this chapter you should understand:
 
 1. What each tool in the project does and why it was chosen.
@@ -185,7 +189,8 @@ secrets are never committed.
    rather than touching `process.env` directly, so all configuration has one
    entry point.
 
-Variables for later stages (Redis, WhatsApp, Azure OpenAI) are listed in
+Phase 1 additionally requires a non-empty `WHATSAPP_VERIFY_TOKEN`. Variables for
+later stages (Redis, WhatsApp sending, Azure OpenAI) are listed in
 `.env.example` but are not validated yet; each will be validated in the stage
 that starts using it.
 
@@ -217,7 +222,10 @@ Because each line is JSON, log tools can filter by any field, for example
 and `conversationId` to exactly this kind of log line.
 
 `pino-http` (added in `app.ts`) writes one line per completed request with the
-method, URL, status code, and response time.
+method, URL path, status code, and response time. Phase 1 removes query strings
+and request headers from those logs so the verification token cannot leak.
+`server.ts` now calls `createLogger(env.logLevel)` and injects that shared logger
+into `createApp`, rather than having application modules load global configuration.
 
 ---
 
@@ -229,7 +237,7 @@ Files: `src/server.ts`, `src/app.ts`, `src/routes/health.route.ts`.
 curl http://localhost:3000/health
         │
         ▼
- server.ts   createApp().listen(3000)      ← the process is listening
+ server.ts   app.listen(3000)             ← app was built with injected config/logger
         │
         ▼
  app.ts      pinoHttp        ← starts timing; will log when the response ends
@@ -267,8 +275,8 @@ Other details in `app.ts`:
   a browser. Our caller is Meta's servers, not browsers, and `cors()` with no
   options would allow every website. It will be enabled with an explicit list
   of allowed origins if a browser client is ever added.
-- Unknown URLs return Express's default `404`. A consistent JSON error format
-  arrives with the error-handling middleware in a later stage.
+- Unknown URLs return Express's default `404`. Phase 1 adds consistent JSON
+  responses for malformed requests (`400`) and unexpected failures (`500`).
 
 ### Graceful shutdown
 
@@ -338,7 +346,8 @@ At runtime (from Stage 2), the app will connect using a **driver adapter**,
 
 ## 10. Verify it yourself
 
-Two focused tests use Node's built-in test runner, with `tsx` loading TypeScript:
+The bootstrap tests use Node's built-in test runner, with `tsx` loading TypeScript.
+`npm test` now also includes the webhook tests added in Phase 1:
 
 ```powershell
 npm test
@@ -348,14 +357,16 @@ node --import tsx --test --test-name-pattern="occupied port" tests/bootstrap.tes
 The health test opens an ephemeral (OS-selected) port and checks the exact
 Stage 1 response. The startup test reserves a port, starts a second process
 on that port, and requires an error log and exit code `1`. It failed before
-the startup fix because the process exited successfully. Both tests clean up
-their listeners and need no database, Redis, or external API credentials.
+the startup fix because the process exited successfully. A Phase 1 regression
+also checks rejection of an unconfigured token. Tests clean up their listeners
+and need no database, Redis, or external API credentials.
 
 With Docker Desktop running:
 
 ```powershell
 npm ci
 Copy-Item .env.example .env
+# Set WHATSAPP_VERIFY_TOKEN in .env (required since Phase 1).
 docker compose up -d --wait
 npm run prisma:generate
 npm run typecheck; npm run lint; npm run format:check; npm run build
@@ -392,17 +403,17 @@ What was verified for this stage:
 
 ---
 
-## 11. Deliberately left for later
+## 11. How the project evolves from here
 
-Each item has a `TODO` in the code or an empty folder kept with `.gitkeep`:
+Phase 1 now supplies the webhook controller, runtime validation, centralized
+error middleware, and webhook HTTP tests. Still outside the current implementation:
 
 - Database models and migrations (`User`, `Conversation`, `Message`).
 - Correlation IDs on every request and in every log line.
-- Centralised error middleware with a consistent JSON error format.
-- Broader HTTP, database, and worker tests beyond the bootstrap smoke tests.
-- The WhatsApp webhook, BullMQ queue and worker, Azure OpenAI provider, and
+- POST signature authentication and broader database/worker tests.
+- The BullMQ queue and worker, Azure OpenAI provider, and
   Redis conversation cache.
 - The health response's final shape, which will add
   `"service": "whatsapp-ai-assistant"`.
 
-**Next:** Chapter 2 — Data model _(coming in Stage 2)_.
+**Next:** [Chapter 2 — Webhook Foundation (Phase 1)](02-webhook-foundation.md).
