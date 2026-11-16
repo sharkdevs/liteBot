@@ -106,6 +106,10 @@ synthetic configuration. Put Node test-runner options before file names.
   automatically when the user asks for setup instructions.
 - Add each new unit test file to the explicit file list in the `npm test` script;
   Redis-dependent tests belong in `test:integration`.
+- BullMQ does not start workers; they are started manually today. Automatic
+  startup (containers, restart policies) and queue-based autoscaling are
+  deliberately deferred until the proof of concept runs end to end (Chapter 3,
+  section 13). Do not add Dockerfiles or scaling configuration unless asked.
 
 ## Target architecture
 

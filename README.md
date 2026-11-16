@@ -504,7 +504,9 @@ the HTTP port or verification token. It starts even if no messages arrive or
 Redis is still starting, and it shuts down on Ctrl+C or `SIGTERM`. Each job
 carries the request's `x-correlation-id`, so API and worker logs for one message
 share the same `correlationId`. You can run several workers at once; BullMQ gives
-each job to one of them.
+each job to one of them. BullMQ does not start workers by itself: today you start
+each one. Automatic startup and scaling are deferred; see
+[the roadmap](#automatic-worker-startup-and-scaling-deferred).
 
 In this phase the worker only **logs** each job (with the message text
 redacted). It does not save data, call Azure OpenAI, or send WhatsApp messages.
@@ -555,15 +557,16 @@ docs/                  Learning guide, one chapter per stage
 
 ## Implementation phases
 
-| Phase                        | Focus                                                                                  | Status  |
-| ---------------------------- | -------------------------------------------------------------------------------------- | ------- |
-| Bootstrap (previous Stage 1) | Tooling, Express, logging, Prisma, Docker Compose                                      | ✅ Done |
-| 1                            | Webhook ownership verification, payload validation, metadata logging, 400/500 handling | ✅ Done |
-| 2                            | BullMQ queue in Redis, separate logging worker, retries, correlation IDs               | ✅ Done |
-| Future                       | POST signature verification                                                            | Planned |
-| Future                       | Data model, migrations, repositories, and persisted inbound messages                   | Planned |
-| Future                       | AI provider, conversation cache, outbound placeholder, and end-to-end worker flow      | Planned |
-| Future                       | Duplicate handling (idempotency) and production durability                             | Planned |
+| Phase                        | Focus                                                                                  | Status   |
+| ---------------------------- | -------------------------------------------------------------------------------------- | -------- |
+| Bootstrap (previous Stage 1) | Tooling, Express, logging, Prisma, Docker Compose                                      | ✅ Done  |
+| 1                            | Webhook ownership verification, payload validation, metadata logging, 400/500 handling | ✅ Done  |
+| 2                            | BullMQ queue in Redis, separate logging worker, retries, correlation IDs               | ✅ Done  |
+| Future                       | POST signature verification                                                            | Planned  |
+| Future                       | Data model, migrations, repositories, and persisted inbound messages                   | Planned  |
+| Future                       | AI provider, conversation cache, outbound placeholder, and end-to-end worker flow      | Planned  |
+| Future                       | Duplicate handling (idempotency) and production durability                             | Planned  |
+| After the end-to-end PoC     | Containerized API and worker, automatic restarts, queue-based worker autoscaling       | Deferred |
 
 The current phase follows the user's phase numbering; the original bootstrap
 remains Chapter 1 in the learning guide. Future implementation order will be
@@ -583,6 +586,27 @@ boundaries above are what let it grow:
   the choice will depend on consistency, residency, and latency requirements.
 
 Each step will be explained in the learning guide when we reach it.
+
+### Automatic worker startup and scaling (deferred)
+
+Today you start each worker yourself. BullMQ only shares jobs among workers that
+are already running; it never starts processes. Making this automatic needs two
+things outside BullMQ:
+
+1. **Automatic start and restart:** run the API and worker as separate
+   containers built from one image, with a
+   [restart policy](https://docs.docker.com/engine/containers/start-containers-automatically/).
+2. **Autoscaling:** host workers on a platform that changes the number of copies
+   with the queue backlog. For example, an
+   [Azure Container Apps scale rule](https://learn.microsoft.com/en-us/azure/container-apps/scale-app),
+   which uses [KEDA](https://keda.sh/docs/latest/scalers/redis-lists/), could
+   watch the Redis list `bull:incoming-messages:wait`.
+
+**We will revisit this once the proof of concept runs end to end.** Sensible
+limits depend on real job durations, Azure OpenAI rate limits, and
+per-conversation ordering, none of which exist yet.
+[Chapter 3, section 13](docs/03-queue-infrastructure.md#13-who-starts-the-worker-automatic-scaling-is-deferred)
+explains the idea and the questions to answer first.
 
 ## License
 

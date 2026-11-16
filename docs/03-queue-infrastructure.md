@@ -28,6 +28,7 @@ By the end of this chapter you should understand:
 5. How retries with exponential backoff work, and what happens after the last one.
 6. How to run the API and worker, watch a job wait, and watch it complete.
 7. What this phase deliberately does **not** guarantee yet.
+8. Who starts workers today, and how automatic scaling could work later.
 
 ---
 
@@ -691,7 +692,104 @@ retention controls exist.
 **Only text messages from known numbers are processed.** Everything else is
 acknowledged and logged as not queued.
 
-## 13. What comes next
+## 13. Who starts the worker? (Automatic scaling is deferred)
+
+A common misunderstanding is that BullMQ starts workers. It does not. The work
+is split like this:
+
+| Who                         | Responsibility                                                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **You, today**              | Start the worker process with `npm run dev:worker` or `npm run start:worker`.                                      |
+| **BullMQ, inside a worker** | Take jobs from Redis, call our processing function, record completion or failure, and schedule retries.            |
+| **A future host platform**  | Start worker processes automatically, restart them if they crash, and change how many are running based on demand. |
+
+One running worker handles many messages, one after another. BullMQ does not
+start a new process for each message. If no worker is running, jobs simply wait
+in Redis, as Experiment A in section 10 shows.
+
+### Two ways to process more messages at once
+
+- **Concurrency inside one worker.** BullMQ's `concurrency` option lets one
+  worker handle several jobs at the same time while each waits on slow
+  input/output, such as a future Azure OpenAI call. The default is 1, and we
+  have not changed it.
+- **More worker processes.** Run more copies of the worker, on the same machine
+  or on different machines. BullMQ gives each job to only one of them.
+
+BullMQ explains both options in
+[Parallelism and Concurrency](https://docs.bullmq.io/guide/parallelism-and-concurrency).
+
+### What "automatic" would mean
+
+There are two separate capabilities, and neither comes from BullMQ:
+
+| Capability                  | Meaning                                                                        | Example tool                                                                                                                                 |
+| --------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Automatic start and restart | Workers run without anyone opening a terminal, and come back after a crash.    | [Docker restart policies](https://docs.docker.com/engine/containers/start-containers-automatically/)                                         |
+| Autoscaling                 | The number of worker copies (**replicas**) goes up and down with the workload. | [Azure Container Apps scale rules](https://learn.microsoft.com/en-us/azure/container-apps/scale-app), built on [KEDA](https://keda.sh/docs/) |
+
+A possible path for this project (an idea to evaluate, not a decision):
+
+1. **Containerize.** Build one Docker image for the application, and run the API
+   (`node dist/server.js`) and the worker (`node dist/worker.js`) as separate
+   containers with a restart policy such as `unless-stopped`. Docker Compose
+   can run a fixed number of workers, but it does not change that number by
+   itself when the backlog grows.
+2. **Deploy where autoscaling is built in.** Azure Container Apps fits the
+   project's Azure direction. It uses KEDA (Kubernetes Event-driven
+   Autoscaling) internally, so we would not run a Kubernetes cluster ourselves.
+   A
+   [Redis list scale rule](https://keda.sh/docs/latest/scalers/redis-lists/)
+   could watch `bull:incoming-messages:wait`, the same list you counted in
+   Experiment A. Example limits might be "at least 1 worker, at most 5, about 20
+   waiting jobs per worker"; real numbers must come from measurements.
+
+```text
+Redis list bull:incoming-messages:wait   (how many jobs are waiting)
+        |
+        | checked periodically by the scale rule
+        v
+Azure Container Apps  -->  adds or removes worker replicas (min 1 ... max N)
+        |
+        v
+worker 1    worker 2    worker 3 ...   (each runs node dist/worker.js;
+                                        BullMQ gives each job to one of them)
+```
+
+### Questions to answer before turning it on
+
+- **The waiting list is not the whole workload.** Jobs being processed are in
+  BullMQ's `active` list, and retries waiting out their backoff are in
+  `delayed`. A rule that watches only `wait` might remove workers that are still
+  busy, so keep at least one worker and scale down conservatively.
+- **Scaling down stops processes.** Our graceful shutdown (section 8) gives an
+  active job up to 10 seconds to finish. A job interrupted after that comes
+  back as a stalled job, or fails if it stalls too often. The platform must also
+  allow enough time for a job to finish before it forcibly stops a replica.
+- **More workers increase duplicate and ordering risks.** Two messages from the
+  same person could be processed at the same time or out of order. Once replies
+  depend on conversation history, we will need per-conversation ordering and
+  the idempotency discussed in section 12.
+- **More workers mean more AI calls.** Scaling out can exceed Azure OpenAI rate
+  limits, so we may need a replica cap or BullMQ's rate limiter.
+- **Redis becomes even more important.** Every replica connects to it, so its
+  durability, connection limits, authentication, and TLS (encrypted
+  connections) matter. The local Compose Redis has no password and is only for
+  development.
+
+### Decision: revisit once the PoC runs end to end
+
+We are **not** adding automatic startup or autoscaling now. The worker only
+logs, so there is nothing meaningful to scale yet, and good limits depend on
+measurements we do not have: how long a real job takes, how many messages
+arrive, and the AI provider's limits.
+
+**We will revisit automatic worker startup and scaling once the proof of concept
+runs end to end:** webhook → queue → worker → database → Azure OpenAI → WhatsApp
+provider placeholder. Then we will measure the real flow and choose the
+platform, scale rule, replica limits, and worker concurrency.
+
+## 14. What comes next
 
 The pipeline exists, but the worker is a placeholder. Later phases will:
 
@@ -700,7 +798,9 @@ The pipeline exists, but the worker is a placeholder. Later phases will:
 - give the worker real steps: load history, build a prompt, call the AI provider,
   save the reply, and call the WhatsApp provider placeholder,
 - add a Redis-backed conversation cache,
-- authenticate webhook deliveries and handle duplicates.
+- authenticate webhook deliveries and handle duplicates,
+- after the end-to-end flow works, revisit automatic worker startup and scaling
+  (section 13).
 
 **Previous:** [Chapter 2 - Webhook Foundation (Phase 1)](02-webhook-foundation.md)
 
@@ -710,9 +810,13 @@ The pipeline exists, but the worker is a placeholder. Later phases will:
 - [BullMQ: retrying failing jobs and backoff](https://docs.bullmq.io/guide/retrying-failing-jobs)
 - [BullMQ: adding jobs in bulk](https://docs.bullmq.io/guide/queues/adding-bulks)
 - [BullMQ: graceful worker shutdown](https://docs.bullmq.io/guide/workers/graceful-shutdown)
+- [BullMQ: parallelism and concurrency](https://docs.bullmq.io/guide/parallelism-and-concurrency)
 - [BullMQ: stalled jobs](https://docs.bullmq.io/guide/jobs/stalled)
 - [BullMQ: going to production (persistence and eviction)](https://docs.bullmq.io/guide/going-to-production)
 - [Redis: production usage with node-redis](https://redis.io/docs/latest/develop/clients/nodejs/produsage/)
 - [Redis: persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
 - [Meta: WhatsApp webhooks overview and delivery retries](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/overview#webhook-delivery-failure)
 - [Redis: `SCRIPT FLUSH` and the script cache](https://redis.io/docs/latest/commands/script-flush/)
+- [Docker: start containers automatically (restart policies)](https://docs.docker.com/engine/containers/start-containers-automatically/)
+- [Azure Container Apps: scaling](https://learn.microsoft.com/en-us/azure/container-apps/scale-app)
+- [KEDA: Redis lists scaler](https://keda.sh/docs/latest/scalers/redis-lists/)
