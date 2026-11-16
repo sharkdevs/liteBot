@@ -6,6 +6,7 @@ type LogLevel = (typeof LOG_LEVELS)[number];
 export interface Env {
   readonly port: number;
   readonly logLevel: LogLevel;
+  readonly whatsappVerifyToken: string;
 }
 
 function parsePort(value: string | undefined): number {
@@ -24,9 +25,17 @@ function parseLogLevel(value: string | undefined): LogLevel {
   return level as LogLevel;
 }
 
-// TODO(later stages): validate DATABASE_URL, Redis, WhatsApp, and Azure OpenAI settings
+function parseVerifyToken(value: string | undefined): string {
+  if (!value || value.trim().length === 0) {
+    throw new Error('WHATSAPP_VERIFY_TOKEN must be configured with a non-empty value');
+  }
+  return value;
+}
+
+// TODO(later stages): validate DATABASE_URL, Redis, WhatsApp sending, and Azure OpenAI settings
 // when the features that need them are introduced.
 export const env: Env = Object.freeze({
   port: parsePort(process.env.PORT),
   logLevel: parseLogLevel(process.env.LOG_LEVEL),
+  whatsappVerifyToken: parseVerifyToken(process.env.WHATSAPP_VERIFY_TOKEN),
 });
