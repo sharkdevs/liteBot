@@ -29,9 +29,11 @@ the entire target system at once.
 ```powershell
 npm run dev               # API: tsx watch src/server.ts
 npm run dev:worker        # Worker: tsx watch src/worker.ts (separate process)
+npm run dev:whatsapp      # Sending worker: tsx watch src/whatsapp.worker.ts (sends queued work)
 npm run build             # tsc -p tsconfig.build.json → dist/
 npm start                 # node dist/server.js
 npm run start:worker      # node dist/worker.js
+npm run start:whatsapp    # node dist/whatsapp.worker.js
 npm run typecheck         # tsc --noEmit (tsx does not type-check)
 npm test                  # Node's built-in runner, using tsx for TypeScript (no Redis or PostgreSQL)
 npm run test:integration  # real BullMQ (Redis) and real persistence (PostgreSQL, throwaway DB)
@@ -56,8 +58,10 @@ persistence tests create a `litebot_test_<hex>` database via `TEST_DATABASE_URL`
 apply migrations with `prisma migrate deploy`, and drop it afterwards. Never
 flush or stop the shared Compose Redis or touch the development database from
 tests. API startup requires a non-empty `WHATSAPP_VERIFY_TOKEN` and a PostgreSQL
-`DATABASE_URL`; worker startup requires `DATABASE_URL` and AI settings. Tests
-inject synthetic configuration and must never call live Azure. Put Node
+`DATABASE_URL`; AI worker startup requires `DATABASE_URL` and AI settings.
+WhatsApp worker startup requires `DATABASE_URL`, `WHATSAPP_ACCESS_TOKEN`, and
+`WHATSAPP_PHONE_NUMBER_ID`, but no AI settings. Tests inject synthetic
+configuration and must never call live Azure or send real WhatsApp messages. Put Node
 test-runner options before file names. Run unit and integration suites one after
 the other, not concurrently; parallel runs cause timing flakiness.
 
@@ -93,17 +97,21 @@ required column to a table that may have rows.
   client, Redis connection, `ConversationService`,
   `createAiProvider(env.ai, new PromptBuilder())`, and `AiResponseService`, then
   passes `(job) => aiResponseService.process(job)` to `createMessageWorker()`.
+  It also owns an `OutgoingMessageQueue` on a separate producer Redis connection.
+  `whatsapp.worker.ts` composes `WhatsAppDeliveryService`, `MessageRepository`,
+  and `WhatsAppCloudApiProvider` using `loadWhatsAppWorkerEnv()`.
   Keep `app.ts` free of `listen()`, environment loading, and Redis or Prisma
   construction so tests can use isolated dependencies.
 
-## Current implementation (Phase 4: AI integration)
+## Current implementation (Phase 5: outbound messaging)
 
 - Implemented: GET verification, POST validation, saving each supported text
   message (with its user and conversation) in PostgreSQL, enqueueing it to
   BullMQ queue `incoming-messages`, and a separate worker that generates an AI
-  reply through Azure AI Foundry and saves it as an `OUTBOUND` message. Not
-  implemented: caching, WhatsApp sending, status-webhook processing, signature
-  verification, or idempotent AI processing. Do not interpret the target flow
+  reply through Azure AI Foundry, saves it as `OUTBOUND` / `PENDING`, then publishes
+  to `outgoing-messages`. A dedicated WhatsApp worker sends and records acceptance.
+  Not implemented: caching, status-webhook processing, signature verification,
+  transactional outbox, or exactly-once delivery. Do not interpret the target flow
   below as implemented behavior.
 - `WebhookController` owns GET verification and POST handling.
   `parseWebhookPayload(unknown)` validates the complete batch before logging or
@@ -132,14 +140,25 @@ required column to a table that may have rows.
   Do not switch to `addBulk` or other multi/pipeline paths: BullMQ 6.7.6's
   node-redis adapter has no `NOSCRIPT` fallback there, so they fail permanently
   after a Redis restart (covered by an integration test using `SCRIPT FLUSH`).
-- `AiResponseService.process(job)` loads up to 20 earlier messages from the
+- `AiResponseService.process(job)` loads up to 20 recent messages from the
   job's conversation (excluding the current message), calls
   `IAiProvider.generateResponse(userMessage, conversationHistory)`, then saves
   the reply with `ConversationService.saveOutboundMessage()`
   (`whatsappMessageId` NULL). `PromptBuilder` sends the system prompt plus at
-  most 20 user/assistant messages, ending with the current message. Delivery is
-  at least once, so a retry after the reply is saved can create a duplicate
-  `OUTBOUND` row.
+  most 20 user/assistant messages, ending with the current message. A unique
+  `replyToMessageId` reuses a saved reply on incoming retries; publishing uses
+  its outbound database ID as the job ID. Never call WhatsApp from the AI worker.
+- `MessageStatus` is `PENDING`, `SENT`, or `FAILED` for outbound rows, NULL for
+  inbound rows. `SENT` means Meta API acceptance, not delivery/read. Store Meta's
+  receipt in `whatsappMessageId` and never downgrade a recorded `SENT` on failure.
+  Old Phase 4 replies are backfilled but not automatically dispatched.
+- `IWhatsAppProvider.sendTextMessage()` returns `{ providerResponseId }` rather
+  than void so callers can persist/log the receipt. The Cloud API adapter uses
+  Graph v26.0, a 10 s timeout, no HTTP retries, and sanitized typed errors.
+  Transient failures retry via BullMQ; permanent errors use `UnrecoverableError`.
+  Await terminal FAILED persistence inside the processor, not in event listeners.
+  A lost acceptance or failed status write can still cause duplicates or leave
+  PENDING rows; no automatic reconciliation exists yet.
 - `AI_PROVIDER` selects `azure-foundry` (default) or the `openai` and `gemini`
   placeholders, which reject with `Not implemented`. Azure uses the `openai`
   SDK's `OpenAI` class with an HTTPS `/openai/v1/` endpoint; `AZURE_AI_MODEL` is
@@ -166,7 +185,9 @@ required column to a table that may have rows.
 - POSTs are not yet signature-authenticated. Default to local examples; the
   README's temporary tunnel walkthrough is only for isolated, synthetic
   dashboard tests. Real customer traffic or production deployment requires HTTPS and Meta
-  signature verification. Do not open a tunnel or change external accounts
+  signature verification. Keep the WhatsApp worker stopped for synthetic local
+  or dashboard examples: starting it sends any queued outgoing jobs. Do not
+  send live messages, open a tunnel, or change external accounts
   automatically when the user asks for setup instructions.
 - Add each new unit test file to the explicit file list in the `npm test` script;
   Redis- or PostgreSQL-dependent tests belong in `test:integration`.
@@ -182,14 +203,15 @@ required column to a table that may have rows.
   constructor injection and a future NestJS migration.
 - Keep webhook handling thin: validate inbound events, persist messages, enqueue
   BullMQ work, and respond promptly. Workers load conversation history, build the
-  prompt, call AI, save the response, and invoke the WhatsApp provider.
+  prompt, call AI, save the response, and publish outgoing work. A separate
+  WhatsApp worker invokes the sending provider.
 - Put PostgreSQL/Prisma persistence behind repositories. Use Redis for BullMQ and
   conversation caching, with a cache-service abstraction rather than direct
   Redis access from business logic.
 - Put Azure OpenAI and WhatsApp Cloud API behind provider interfaces.
   `IAiProvider.generateResponse(userMessage, conversationHistory)` is the required
   AI contract; inject the Azure implementation through constructors.
-  WhatsApp sending must remain an interface and placeholder, not a live sender.
+  WhatsApp sending must stay behind `IWhatsAppProvider` in the dedicated worker.
 - Model `User` (`id`, `phoneNumber` unique, `createdAt`, `updatedAt`),
   `Conversation` (WhatsApp conversation metadata, as above), and `Message`
   (`id`, `conversationId`, `whatsappMessageId` unique nullable, `direction`,

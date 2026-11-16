@@ -5,6 +5,11 @@ point, the worker only logged each queued job. This phase teaches the worker to
 load recent messages, ask an AI provider for a reply, and save that reply as an
 `OUTBOUND` message. It still does **not** send a WhatsApp message.
 
+> **Phase 5 update:** this chapter explains the Phase 4 milestone. The current AI
+> worker also queues its saved reply for a separate sending worker, and retries
+> reuse the same reply ID. See [Chapter 6](06-outbound-messaging.md). Leave the
+> WhatsApp worker stopped to reproduce this chapter's saved-but-unsent behavior.
+
 ```text
 Webhook
    |
@@ -128,9 +133,9 @@ provider. On success, `AI response generated and saved` includes `durationMs`
 `responseMessageId`. These distinguish a pending provider call from a saved reply
 without exposing either message's text.
 
-Queue processing is still at-least-once. A failure after a reply is saved but
-before the job completes can therefore produce another outbound row on retry;
-idempotent AI processing is a later reliability phase.
+At the end of Phase 4, a retry after saving could create another outbound row.
+Phase 5 adds a unique reply-to-message link so publication retries reuse the
+saved row; external delivery is still at-least-once, as Chapter 6 explains.
 
 ## 5. Configure and run it
 
@@ -202,6 +207,8 @@ instance, query that instance instead.
 - Webhook signature verification or production deployment.
 
 **Previous:** [Chapter 4 - Persistence Layer (Phase 3)](04-persistence-layer.md)
+
+**Next:** [Chapter 6 - Outbound WhatsApp Messaging (Phase 5)](06-outbound-messaging.md)
 
 ## Official references
 
