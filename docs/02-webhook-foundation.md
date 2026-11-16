@@ -220,6 +220,36 @@ Follow the [README setup and webhook examples](../README.md#webhook-verification
 No database, Redis, Meta account, or AI credentials are needed for local examples.
 Only the verification token must be configured to start the server.
 
+### Connecting the dashboard is a separate step
+
+The local examples call the server from your own computer. Meta runs elsewhere:
+it needs a public HTTPS callback URL. The webhook code can still run on your
+computer if a tunnel forwards that public URL to `localhost:3000`.
+For production, the endpoint needs a stable address and an always-on server,
+not a temporary laptop session.
+
+The [dashboard walkthrough](../README.md#connect-to-the-meta-dashboard) explains
+how to start the local server, configure an ngrok tunnel, find the correct Meta
+configuration panel, enter the Callback URL and Verify token, subscribe to
+`messages`, and send a dashboard sample.
+
+These are three different milestones:
+
+1. **Verify and save** succeeds: Meta reached GET and received its challenge.
+2. **Subscribe to messages**: the app requests that category of notifications.
+3. **Test** succeeds: Meta's sample POST reached the receiver and got `200`.
+
+None of these means the application can send WhatsApp replies, and a sample
+does not validate the setup for a real business phone number. This phase only
+acknowledges and logs the modeled event metadata.
+
+The temporary public test is explicitly limited to an isolated development
+setup and synthetic payloads. A tunnel fixes reachability, not authenticity.
+Its inspection tools may retain raw verification URLs and request contents,
+so keep their logs private and close the tunnel after testing.
+
+### Automated checks
+
 ```powershell
 npm test
 node --import tsx --test tests/webhook.test.ts
@@ -247,6 +277,10 @@ raw request body using the app secret, and serve the callback over HTTPS.
 This phase does not implement those mechanisms or claim production authentication.
 It also does not deduplicate deliveries or guarantee durable receipt.
 
+The dashboard walkthrough is a temporary synthetic test, not a production
+deployment recipe. Do not connect real customer traffic until those safeguards
+are implemented.
+
 Persistence, queues, AI generation, and replies remain separate future phases.
 
 ## Official references
@@ -254,3 +288,6 @@ Persistence, queues, AI generation, and replies remain separate future phases.
 - [Meta: webhook verification and event notifications](https://developers.facebook.com/docs/graph-api/webhooks/getting-started/)
 - [Meta: WhatsApp messages envelopes, statuses, and optional phone numbers](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/reference/messages)
 - [Express: error handling](https://expressjs.com/en/guide/error-handling.html)
+- [Meta: configuring the callback URL and Verify token](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/create-webhook-endpoint#configure-webhooks)
+- [Meta: dashboard subscription and sample-event testing](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/set-up-whatsapp-echo-bot)
+- [ngrok: test webhooks locally](https://ngrok.com/docs/share-localhost/webhooks)

@@ -4,14 +4,17 @@ This guide explains how liteBot is built, one stage at a time. Each chapter
 describes what that stage added, why it was needed, how it works, and how to
 check it yourself. Read the chapters in order; later ones build on earlier ones.
 
-| Chapter                                                     | You will learn                                                                       |
-| ----------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| [1. Bootstrap](01-bootstrap.md)                             | How the project is set up, how a request reaches `/health`, and why each tool exists |
-| [2. Webhook Foundation (Phase 1)](02-webhook-foundation.md) | Ownership verification, runtime payload validation, safe logging, and HTTP errors    |
+| Chapter                                                     | You will learn                                                                                    |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| [1. Bootstrap](01-bootstrap.md)                             | How the project is set up, how a request reaches `/health`, and why each tool exists              |
+| [2. Webhook Foundation (Phase 1)](02-webhook-foundation.md) | Ownership verification, dashboard/tunnel setup, payload validation, safe logging, and HTTP errors |
 
 The user named the webhook work "Phase 1"; the earlier bootstrap stays Chapter 1.
 Upcoming chapters will cover authenticated deliveries, the data model, queues
 and workers, AI replies, and the end-to-end flow.
+
+For the practical Meta connection steps, start with the
+[dashboard walkthrough](../README.md#connect-to-the-meta-dashboard).
 
 ## Glossary
 
@@ -36,3 +39,6 @@ Terms are added here as chapters introduce them.
 | Payload projection   | A new object containing only explicitly selected fields from a larger payload.                             |
 | Transpile            | Convert source code from one language to another, here TypeScript to JavaScript.                           |
 | Webhook              | A URL that another service calls to tell us something happened (Meta calls ours on messages).              |
+| Callback URL         | The public endpoint address registered with another service so it knows where to send notifications.       |
+| HTTPS tunnel         | A public HTTPS endpoint that forwards requests to a server running on your computer.                       |
+| Webhook subscription | A selection of event categories, such as `messages`, that an app asks the provider to deliver.             |

@@ -71,8 +71,11 @@ requires a non-empty `WHATSAPP_VERIFY_TOKEN`; tests inject synthetic configurati
   not a database/domain model.
 - Never log raw request bodies, verification queries, or headers. HTTP logs
   omit query strings and headers; webhook logs contain the validated projection.
-- POSTs are not yet signature-authenticated. Keep this foundation local until
-  HTTPS and Meta signature verification are implemented.
+- POSTs are not yet signature-authenticated. Default to local examples; the
+  README's temporary tunnel walkthrough is only for isolated, synthetic
+  dashboard tests. Real customer traffic or production deployment requires HTTPS and Meta
+  signature verification. Do not open a tunnel or change external accounts
+  automatically when the user asks for setup instructions.
 - Add each new test file to the explicit file list in the `npm test` script.
 
 ## Target architecture

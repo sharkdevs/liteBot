@@ -210,6 +210,160 @@ phone numbers are still personal data and require appropriate log controls.
 Read [Chapter 2](docs/02-webhook-foundation.md) for the validation contract,
 request flow, and explanation of every new component.
 
+### Does the webhook have to be hosted?
+
+Meta needs a **publicly reachable HTTPS URL**, but the code does not need to be
+deployed to a cloud host while you are developing. A tunnel can forward a public
+HTTPS address to the server running on your computer:
+
+```text
+Meta -> https://<your-tunnel-host>/webhook -> tunnel -> http://localhost:3000/webhook
+```
+
+`localhost` means the computer making the request. Meta cannot use your
+`http://localhost:3000/webhook` address to reach your laptop. A tunnel solves that
+networking problem; it does not add webhook authentication.
+
+For production, use a stable, always-on HTTPS endpoint (for example on Azure App
+Service or Azure Container Apps) after implementing signature verification and
+the other production safeguards. A laptop and temporary tunnel are not that setup.
+
+### Connect to the Meta dashboard
+
+**Testing boundary:** the current receiver does not verify POST signatures.
+The following is a short, controlled exercise using a development app/test
+resources and Meta's sample event, not real customer traffic. While a tunnel is
+open, anyone who reaches its URL can send fake events. If your app is already
+connected to production accounts, do not point it at this receiver. Stop the
+tunnel after the exercise.
+
+#### 1. Prepare the Meta app
+
+Open [Meta for Developers - My Apps](https://developers.facebook.com/apps).
+Use your development app with the **Connect with customers through WhatsApp**
+use case. If you do not have one, follow
+[Meta's getting-started guide](https://developers.facebook.com/documentation/business-messaging/whatsapp/get-started)
+to register as a developer, create the app, and complete its business-portfolio
+setup. This is the developer **App Dashboard**, not just WhatsApp Manager.
+
+Use the app's test setup. You do not need to publish the app to Live mode merely
+to use the dashboard's `messages` sample test.
+
+#### 2. Start this project locally
+
+Complete [Local setup](#local-setup) first if you have not installed the
+dependencies and created `.env`.
+
+Edit your existing `.env` without overwriting other settings:
+
+```dotenv
+PORT=3000
+WHATSAPP_VERIFY_TOKEN=replace-with-your-own-private-token
+```
+
+Replace the example token with a private value of your own. Keep it out of Git,
+chat, and screenshots. Start or restart the server so it reads that value:
+
+```powershell
+npm run dev
+```
+
+Leave that terminal running. In another terminal, confirm local connectivity:
+
+```powershell
+Invoke-RestMethod 'http://localhost:3000/health'
+# status: healthy
+```
+
+#### 3. Give Meta a public HTTPS address
+
+One development option is [ngrok](https://ngrok.com/docs/share-localhost/webhooks).
+Create an ngrok account and install its agent using the
+[official download instructions](https://ngrok.com/download). These are external
+development tools, not dependencies added to this repository.
+
+Copy your **ngrok authtoken** from your own ngrok dashboard and configure it
+locally, replacing the placeholder below:
+
+```powershell
+ngrok config add-authtoken "YOUR_NGROK_AUTHTOKEN"
+ngrok http 3000
+```
+
+The ngrok authtoken is **not** `WHATSAPP_VERIFY_TOKEN`, and neither is the Meta
+WhatsApp access token. Do not put an ngrok token into Meta's Verify token field.
+
+Use the same port as `PORT` if you changed it from 3000. Copy the **HTTPS
+forwarding URL** printed by ngrok and append `/webhook`. Leave both ngrok and
+the Node server running.
+
+The tunnel provider and its traffic inspector may see raw URLs, headers, and
+payloads, even though our Pino logs omit sensitive fields. Treat those inspection
+logs as private; use only the isolated test setup here.
+
+#### 4. Set the callback URL and verification token
+
+In the Meta App Dashboard, open your app, then navigate to
+**Use cases -> Connect with customers through WhatsApp -> Customize ->
+Configuration**. In the older dashboard layout, use
+**WhatsApp -> Configuration**. Find the **Webhooks** section and its
+callback configuration/edit control.
+
+| Dashboard field  | What to enter                                                                                        |
+| ---------------- | ---------------------------------------------------------------------------------------------------- |
+| **Callback URL** | The actual HTTPS tunnel URL followed by `/webhook`, for example `https://<your-tunnel-host>/webhook` |
+| **Verify token** | The exact value of `WHATSAPP_VERIFY_TOKEN` in your `.env`                                            |
+
+Do not use `/health`, `localhost`, or the domain alone. Do not append the
+`hub.*` query parameters yourself; Meta adds them during verification.
+
+Click **Verify and save**. Meta calls GET, our server echoes its challenge, and
+the dashboard should save the callback. Your server terminal should contain
+`Webhook verification succeeded`.
+
+#### 5. Subscribe to `messages` and send a sample event
+
+Saving the callback and subscribing to a field are separate steps. In the
+webhook fields list, find **messages** and enable its **Subscribe** control.
+Then use the **Test** link for that field and send its sample notification.
+Meta documents this sample test as available in both Development and Live modes.
+
+Watch the terminal running `npm run dev`. A successful POST produces
+`WhatsApp webhook payload received` and `WhatsApp webhook event received`,
+with the modeled metadata when present, and returns `200 OK`.
+**No WhatsApp reply is expected:** this phase only logs and acknowledges.
+
+The dashboard sample proves that the callback path works. It does not prove
+that a real phone number/account is correctly connected or subscribed. Real
+message testing also requires the account/number setup under **API Setup**;
+do that with authenticated delivery in a later phase, not with customer traffic
+on this temporary receiver.
+
+#### 6. End the test
+
+Stop ngrok with Ctrl+C when finished; stop the local server if you no longer
+need it. Disconnect the temporary test subscription/callback if you are done
+with it. If the public URL changes on a later session, update the Callback URL
+and run **Verify and save** again. Meta cannot deliver while your server or
+tunnel is stopped.
+
+### Dashboard troubleshooting
+
+| Symptom                                              | Check                                                                                                  |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Verification times out or the tunnel returns 502     | Both processes are running; ngrok targets the same port as `PORT`; the public hostname is current      |
+| Verification returns 403                             | The Verify token exactly matches `.env`; restart after changing it; do not use a WhatsApp access token |
+| Callback returns 404 or health JSON                  | The Callback URL must end in `/webhook`, not `/health` or just the host                                |
+| Opening `/webhook` directly in a browser returns 403 | Expected without Meta's verification query parameters; this alone does not mean the endpoint is broken |
+| Meta receives a login page or other HTML             | It must reach the actual endpoint without interactive browser authentication or an intervening page    |
+| Verification succeeds but there are no POST logs     | Subscribe to **messages**, use that field's **Test**, and check the same app's callback configuration  |
+| A sample POST returns 400                            | Select the WhatsApp **messages** test, not another webhook object; the receiver validates the envelope |
+| POST succeeds but there is no WhatsApp reply         | Expected for Phase 1; sending and business logic are not implemented                                   |
+
+Sources: [Meta callback configuration](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/create-webhook-endpoint#configure-webhooks),
+[Meta dashboard sample tests](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/set-up-whatsapp-echo-bot),
+and [ngrok local webhook testing](https://ngrok.com/docs/share-localhost/webhooks).
+
 ## Environment variables
 
 Defined in [`.env.example`](.env.example). Copy it to `.env`; never commit `.env`.
