@@ -6,10 +6,14 @@ import { promisify } from 'node:util';
 import { pino } from 'pino';
 
 import { createApp } from '../src/app.js';
+import type {
+  IncomingMessageJob,
+  IncomingMessageQueuePort,
+} from '../src/shared/types/incoming-message-job.js';
 
 const verifyToken = 'test-webhook-verification-token';
 
-async function startApp(t: TestContext) {
+async function startApp(t: TestContext, publisher?: IncomingMessageQueuePort) {
   const logs: string[] = [];
   const destination = new Writable({
     write(chunk: Buffer, _encoding, callback) {
@@ -18,14 +22,25 @@ async function startApp(t: TestContext) {
     },
   });
   const logger = pino({}, destination);
-  const server = createApp({ logger, whatsappVerifyToken: verifyToken }).listen(0, '127.0.0.1');
+  const jobs: IncomingMessageJob[] = [];
+  const incomingMessageQueue = publisher ?? {
+    enqueue(messages: IncomingMessageJob[]) {
+      jobs.push(...messages);
+      return Promise.resolve();
+    },
+  };
+  const server = createApp({
+    logger,
+    whatsappVerifyToken: verifyToken,
+    incomingMessageQueue,
+  }).listen(0, '127.0.0.1');
   t.after(async () => {
     await promisify(server.close.bind(server))();
   });
   await once(server, 'listening');
   const address = server.address();
   assert.ok(address && typeof address !== 'string');
-  return { url: `http://127.0.0.1:${String(address.port)}/webhook`, logs, logger };
+  return { url: `http://127.0.0.1:${String(address.port)}/webhook`, logs, logger, jobs };
 }
 
 await test('verification echoes the challenge as plain text without logging secrets', async (t) => {
@@ -90,6 +105,7 @@ await test('POST acknowledges a batch and logs only the validated payload metada
         id: 'wamid.first',
         from: '15550000001',
         type: 'text',
+        timestamp: '1794844800',
         text: { body: 'PRIVATE_MESSAGE_TEXT' },
         unexpected_secret: 'PRIVATE_UNKNOWN_FIELD',
       },
@@ -111,7 +127,7 @@ await test('POST acknowledges a batch and logs only the validated payload metada
   assert.equal(response.status, 200);
   assert.equal(await response.text(), 'OK');
   const output = logs.join('');
-  assert.match(output, /"payload":\{"object":"whatsapp_business_account"/);
+  assert.match(output, /WhatsApp webhook payload received/);
   assert.match(
     output,
     /"eventType":"messages","phoneNumber":"15550000001","messageId":"wamid.first"/,
@@ -178,7 +194,7 @@ for (const { name, body } of malformedPayloads) {
     });
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), { error: 'Malformed request' });
-    assert.doesNotMatch(logs.join(''), /"payload":/);
+    assert.doesNotMatch(logs.join(''), /WhatsApp webhook payload received/);
   });
 }
 
@@ -193,7 +209,7 @@ await test('POST rejects a malformed later entry before logging any accepted pay
   });
   assert.equal(response.status, 400);
   await response.text();
-  assert.doesNotMatch(logs.join(''), /"payload":|"messageId":/);
+  assert.doesNotMatch(logs.join(''), /WhatsApp webhook payload received|"messageId":/);
 });
 
 for (const { name, body, contentType } of [
@@ -241,3 +257,115 @@ await test('POST returns a generic 500 for an unexpected failure', async (t) => 
   assert.equal(response.status, 500);
   assert.deepEqual(await response.json(), { error: 'Internal server error' });
 });
+
+function textMessage(id = 'wamid.queued') {
+  return {
+    id,
+    from: '15550000001',
+    type: 'text',
+    text: { body: 'PRIVATE_QUEUED_TEXT' },
+    timestamp: '1794844800',
+  };
+}
+
+await test('POST enqueues text messages across entries with the request correlation ID', async (t) => {
+  const { url, jobs, logs } = await startApp(t);
+  const payload = payloadWith({ messages: [textMessage('wamid.first')] });
+  payload.entry.push(...payloadWith({ messages: [textMessage('wamid.second')] }).entry);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-correlation-id': 'webhook-queue-test' },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), 'OK');
+  assert.equal(response.headers.get('x-correlation-id'), 'webhook-queue-test');
+  assert.deepEqual(
+    jobs,
+    ['wamid.first', 'wamid.second'].map((messageId) => ({
+      phoneNumber: '15550000001',
+      messageId,
+      messageText: 'PRIVATE_QUEUED_TEXT',
+      timestamp: '1794844800',
+      correlationId: 'webhook-queue-test',
+    })),
+  );
+  assert.doesNotMatch(logs.join(''), /PRIVATE_QUEUED_TEXT/);
+});
+
+await test('POST reports queue failure as 500 instead of acknowledging lost work', async (t) => {
+  const { url, logs } = await startApp(t, {
+    enqueue: () => Promise.reject(new Error('PRIVATE_QUEUE_FAILURE')),
+  });
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-correlation-id': 'queue-failure-test' },
+    body: JSON.stringify(payloadWith({ messages: [textMessage()] })),
+  });
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), { error: 'Internal server error' });
+  assert.match(logs.join(''), /"correlationId":"queue-failure-test"/);
+});
+
+await test('POST rejects a malformed later text message before enqueueing any job', async (t) => {
+  const { url, jobs } = await startApp(t);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(
+      payloadWith({
+        messages: [textMessage(), { ...textMessage('wamid.invalid'), text: { body: 42 } }],
+      }),
+    ),
+  });
+  assert.equal(response.status, 400);
+  await response.text();
+  assert.deepEqual(jobs, []);
+});
+
+for (const timestamp of [undefined, 'not-a-timestamp', '-1', 1794844800]) {
+  await test(`POST rejects an invalid text-message timestamp: ${String(timestamp)}`, async (t) => {
+    const { url, jobs } = await startApp(t);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payloadWith({ messages: [{ ...textMessage(), timestamp }] })),
+    });
+    assert.equal(response.status, 400);
+    await response.text();
+    assert.deepEqual(jobs, []);
+  });
+}
+
+await test('POST acknowledges statuses, non-text and phone-less messages without queueing', async (t) => {
+  const { url, jobs, logs } = await startApp(t);
+  const payload = payloadWith({
+    messages: [
+      { id: 'wamid.image', from: '15550000001', type: 'image' },
+      { ...textMessage('wamid.no-phone'), from: undefined },
+    ],
+  });
+  payload.entry.push(...payloadWith({ statuses: [{ status: 'delivered' }] }).entry);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.deepEqual(jobs, []);
+  assert.match(logs.join(''), /unsupported_message_type/);
+  assert.match(logs.join(''), /missing_phone_number/);
+});
+
+for (const supplied of [undefined, 'unsafe/correlation/value']) {
+  await test(`requests generate a safe correlation ID for ${String(supplied)}`, async (t) => {
+    const { url } = await startApp(t);
+    const response = await fetch(url, {
+      headers: supplied ? { 'x-correlation-id': supplied } : {},
+    });
+    assert.equal(response.status, 403);
+    assert.match(response.headers.get('x-correlation-id') ?? '', /^[a-f0-9-]{36}$/);
+    await response.text();
+  });
+}

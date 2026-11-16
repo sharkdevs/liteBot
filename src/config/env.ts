@@ -1,18 +1,24 @@
 import 'dotenv/config';
 
+import type { RedisSettings } from './redis.js';
+
 const LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'] as const;
 type LogLevel = (typeof LOG_LEVELS)[number];
 
-export interface Env {
-  readonly port: number;
+export interface WorkerEnv {
   readonly logLevel: LogLevel;
+  readonly redis: RedisSettings;
+}
+
+export interface Env extends WorkerEnv {
+  readonly port: number;
   readonly whatsappVerifyToken: string;
 }
 
-function parsePort(value: string | undefined): number {
-  const port = Number(value ?? '3000');
+function parsePort(value: string | undefined, name: string, defaultPort: number): number {
+  const port = Number(value ?? defaultPort);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`PORT must be an integer between 1 and 65535, received "${String(value)}"`);
+    throw new Error(`${name} must be an integer between 1 and 65535, received "${String(value)}"`);
   }
   return port;
 }
@@ -32,10 +38,26 @@ function parseVerifyToken(value: string | undefined): string {
   return value;
 }
 
-// TODO(later stages): validate DATABASE_URL, Redis, WhatsApp sending, and Azure OpenAI settings
-// when the features that need them are introduced.
-export const env: Env = Object.freeze({
-  port: parsePort(process.env.PORT),
-  logLevel: parseLogLevel(process.env.LOG_LEVEL),
-  whatsappVerifyToken: parseVerifyToken(process.env.WHATSAPP_VERIFY_TOKEN),
-});
+export function loadWorkerEnv(source: NodeJS.ProcessEnv = process.env): WorkerEnv {
+  const host = source.REDIS_HOST ?? 'localhost';
+  if (!host.trim()) {
+    throw new Error('REDIS_HOST must be a non-empty hostname');
+  }
+  return Object.freeze({
+    logLevel: parseLogLevel(source.LOG_LEVEL),
+    redis: Object.freeze({
+      host: host.trim(),
+      port: parsePort(source.REDIS_PORT, 'REDIS_PORT', 6379),
+    }),
+  });
+}
+
+export function loadApiEnv(source: NodeJS.ProcessEnv = process.env): Env {
+  return Object.freeze({
+    port: parsePort(source.PORT, 'PORT', 3000),
+    whatsappVerifyToken: parseVerifyToken(source.WHATSAPP_VERIFY_TOKEN),
+    ...loadWorkerEnv(source),
+  });
+}
+
+// TODO(later stages): validate database, WhatsApp sending, and AI settings when used.

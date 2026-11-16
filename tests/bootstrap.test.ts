@@ -35,6 +35,9 @@ await test('health returns the Stage 1 response without database or Redis connec
   const server = createApp({
     logger: createLogger('silent'),
     whatsappVerifyToken: 'test-verification-token',
+    incomingMessageQueue: {
+      enqueue: () => Promise.reject(new Error('Health requests must not enqueue jobs')),
+    },
   }).listen(0, '127.0.0.1');
   t.after(async () => {
     await promisify(server.close.bind(server))();
@@ -68,6 +71,8 @@ await test('an occupied port produces an error and a nonzero exit, not a success
           PORT: String(address.port),
           LOG_LEVEL: 'info',
           WHATSAPP_VERIFY_TOKEN: 'test-verification-token',
+          REDIS_HOST: '127.0.0.1',
+          REDIS_PORT: '1',
         },
         timeout: 10_000,
       },
