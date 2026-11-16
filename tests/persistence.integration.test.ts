@@ -9,6 +9,8 @@ import { WhatsappMessageIdConflictError } from '../src/domain/message/message-id
 import { ConversationRepository } from '../src/repositories/conversation.repository.js';
 import { UserRepository } from '../src/repositories/user.repository.js';
 import { MessageRepository } from '../src/repositories/message.repository.js';
+import { WhatsAppCloudApiProvider } from '../src/providers/whatsapp/whatsapp-cloud-api.provider.js';
+import { WhatsAppDeliveryService } from '../src/services/whatsapp-delivery.service.js';
 import { PrismaUnitOfWork, type IUnitOfWork } from '../src/repositories/unit-of-work.js';
 import type { IAiProvider } from '../src/providers/ai/index.js';
 import { AiResponseService } from '../src/services/ai-response.service.js';
@@ -528,6 +530,42 @@ await test('persistence layer', async (t) => {
         'waiting',
         'AI completion does not wait for transport',
       );
+      let sends = 0;
+      const attempts: number[] = [];
+      const transport = new WhatsAppCloudApiProvider(
+        { accessToken: 'SYNTHETIC_TOKEN', phoneNumberId: '123456789' },
+        async (_url, init) => {
+          sends++;
+          attempts.push(performance.now());
+          assert.equal(
+            (await prisma.message.findUniqueOrThrow({ where: { id: savedResponse.id } })).status,
+            'PENDING',
+          );
+          assert.ok(typeof init?.body === 'string');
+          const payload = JSON.parse(init.body) as { to: string; text: { body: string } };
+          assert.equal(payload.to, phoneNumber);
+          assert.equal(payload.text.body, 'Synthetic AI response');
+          if (sends < 3) {
+            return Response.json(
+              { error: { code: 131016, message: 'PRIVATE_META_FAILURE' } },
+              { status: 503 },
+            );
+          }
+          return Response.json({ messages: [{ id: 'wamid.outbound-accepted' }] });
+        },
+      );
+      const whatsappWorker = fixture.startWhatsAppWorker(
+        new WhatsAppDeliveryService(new MessageRepository(prisma), transport, fixture.logger),
+      );
+      await once(whatsappWorker, 'completed', { signal: AbortSignal.timeout(10_000) });
+      assert.equal(sends, 3);
+      assert.ok((attempts[1] ?? 0) - (attempts[0] ?? 0) >= 900);
+      assert.ok((attempts[2] ?? 0) - (attempts[1] ?? 0) >= 1900);
+      const accepted = await prisma.message.findUniqueOrThrow({ where: { id: savedResponse.id } });
+      assert.equal(accepted.status, 'SENT');
+      assert.equal(accepted.whatsappMessageId, 'wamid.outbound-accepted');
+      assert.match(fixture.logs.join(''), /"providerResponseId":"wamid.outbound-accepted"/);
+      assert.doesNotMatch(fixture.logs.join(''), /PRIVATE_META_FAILURE|SYNTHETIC_TOKEN/);
 
       // Meta retries a delivery it thinks failed: nothing new is saved or queued.
       assert.equal((await post()).status, 200);
@@ -537,4 +575,65 @@ await test('persistence layer', async (t) => {
       assert.doesNotMatch(fixture.logs.join(''), /Synthetic AI response/);
     },
   );
+
+  for (const [label, status, code, expectedAttempts] of [
+    ['exhausted transient errors', 503, 131016, 3],
+    ['permanent authentication error', 401, 190, 1],
+  ] as const) {
+    await t.test(
+      `outbound ${label} persist FAILED without regenerating AI`,
+      { timeout: 15_000 },
+      async (t) => {
+        const fixture = await setupQueue(t);
+        const service = new ConversationService(unitOfWork, fixture.logger);
+        const phoneNumber = syntheticPhoneNumber();
+        const recorded = await service.recordInboundMessage(
+          inbound(phoneNumber, `wamid.${String(code)}`),
+        );
+        const reply = await service.saveOutboundMessage(
+          recorded.conversationId,
+          'PRIVATE_FAILED_REPLY',
+          recorded.messageId,
+        );
+        let requests = 0;
+        const provider = new WhatsAppCloudApiProvider(
+          { accessToken: 'SYNTHETIC_TOKEN', phoneNumberId: '123456789' },
+          () => {
+            requests++;
+            return Promise.resolve(
+              Response.json({ error: { code, message: 'PRIVATE_META_FAILURE' } }, { status }),
+            );
+          },
+        );
+        const worker = fixture.startWhatsAppWorker(
+          new WhatsAppDeliveryService(new MessageRepository(prisma), provider, fixture.logger),
+        );
+        const exhausted = new Promise<void>((resolve) => {
+          worker.on('failed', (job) => {
+            if (job?.attemptsMade === expectedAttempts) resolve();
+          });
+        });
+        await fixture.outgoingQueue.enqueue({
+          phoneNumber,
+          conversationId: recorded.conversationId,
+          messageId: reply.id,
+          content: reply.content,
+          correlationId: 'outgoing-failure',
+          userId: recorded.userId,
+        });
+        await exhausted;
+        assert.equal(requests, expectedAttempts);
+        assert.equal(
+          (await prisma.message.findUniqueOrThrow({ where: { id: reply.id } })).status,
+          'FAILED',
+        );
+        assert.equal(await fixture.outgoingInspector.getFailedCount(), 1);
+        assert.equal(await fixture.outgoingInspector.getCompletedCount(), 0);
+        assert.doesNotMatch(
+          fixture.logs.join(''),
+          /PRIVATE_FAILED_REPLY|PRIVATE_META_FAILURE|SYNTHETIC_TOKEN/,
+        );
+      },
+    );
+  }
 });

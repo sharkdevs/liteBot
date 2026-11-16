@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { test } from 'node:test';
 import { createClient } from 'redis';
+import { WhatsAppProviderError } from '../src/providers/whatsapp/whatsapp-provider.js';
 
 import type { IConversationService } from '../src/services/conversation.service.js';
 import type { IncomingMessageJob } from '../src/shared/types/incoming-message-job.js';
@@ -228,3 +229,37 @@ await test('outgoing publication deduplicates the saved reply ID and fails promp
   connection.disconnect();
   await assert.rejects(outgoingQueue.enqueue({ ...outgoing, messageId: 'offline' }), /not ready/);
 });
+
+await test(
+  'terminal status write failures are awaited, surfaced, and never reported as success',
+  { timeout: 10_000 },
+  async (t) => {
+    const { outgoingQueue, outgoingInspector, logs, startWhatsAppWorker } = await setupQueue(t);
+    let statusWrites = 0;
+    const worker = startWhatsAppWorker({
+      send: () =>
+        Promise.reject(new WhatsAppProviderError('PRIVATE_PROVIDER_FAILURE', false, 401, 190)),
+      markFailed: () => {
+        statusWrites++;
+        return Promise.reject(new Error('PRIVATE_DATABASE_FAILURE'));
+      },
+    });
+    const failed = once(worker, 'failed', { signal: AbortSignal.timeout(5000) });
+    await outgoingQueue.enqueue({
+      phoneNumber: message.phoneNumber,
+      conversationId: message.conversationId,
+      messageId: 'failure-state-write',
+      content: 'PRIVATE_CONTENT',
+      correlationId: message.correlationId,
+      userId: message.userId,
+    });
+    await failed;
+    assert.equal(statusWrites, 1);
+    const saved = await outgoingInspector.getJob('failure-state-write');
+    assert.ok(saved);
+    assert.equal(await saved.getState(), 'failed');
+    assert.equal(saved.failedReason, 'Outgoing message failure status persistence failed');
+    assert.match(logs.join(''), /FAILED status could not be persisted/);
+    assert.doesNotMatch(logs.join(''), /processing completed|PRIVATE_/);
+  },
+);

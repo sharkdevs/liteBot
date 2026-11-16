@@ -94,76 +94,80 @@ await test('an occupied port produces an error and a nonzero exit, not a success
   );
 });
 
-await test(
-  'a worker can shut down while Redis has never connected',
-  { timeout: 8000 },
-  async (t) => {
-    const reservation = createServer();
-    reservation.listen(0, '127.0.0.1');
-    await once(reservation, 'listening');
-    const address = reservation.address();
-    assert.ok(address && typeof address !== 'string');
-    await promisify(reservation.close.bind(reservation))();
-    const child = spawn(
-      process.execPath,
-      [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '--eval',
-        `
+for (const entrypoint of ['worker.ts', 'whatsapp.worker.ts']) {
+  await test(
+    `${entrypoint} can shut down while Redis has never connected`,
+    { timeout: 8000 },
+    async (t) => {
+      const reservation = createServer();
+      reservation.listen(0, '127.0.0.1');
+      await once(reservation, 'listening');
+      const address = reservation.address();
+      assert.ok(address && typeof address !== 'string');
+      await promisify(reservation.close.bind(reservation))();
+      const child = spawn(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          '--input-type=module',
+          '--eval',
+          `
       process.once('message', () => {
         process.disconnect();
         process.emit('SIGTERM');
       });
-      await import(${JSON.stringify(new URL('../src/worker.ts', import.meta.url).href)});
+      await import(${JSON.stringify(new URL(`../src/${entrypoint}`, import.meta.url).href)});
     `,
-      ],
-      {
-        env: {
-          ...process.env,
-          LOG_LEVEL: 'info',
-          PORT: 'not-used-by-worker',
-          WHATSAPP_VERIFY_TOKEN: '',
-          REDIS_HOST: '127.0.0.1',
-          REDIS_PORT: String(address.port),
-          DATABASE_URL: 'postgresql://test:test@127.0.0.1:5432/litebot',
-          AI_PROVIDER: 'azure-foundry',
-          AZURE_AI_FOUNDRY_ENDPOINT: 'https://foundry.example.com/openai/v1/',
-          AZURE_AI_FOUNDRY_API_KEY: 'synthetic-key',
+        ],
+        {
+          env: {
+            ...process.env,
+            LOG_LEVEL: 'info',
+            PORT: 'not-used-by-worker',
+            WHATSAPP_VERIFY_TOKEN: '',
+            REDIS_HOST: '127.0.0.1',
+            REDIS_PORT: String(address.port),
+            DATABASE_URL: 'postgresql://test:test@127.0.0.1:5432/litebot',
+            AI_PROVIDER: 'azure-foundry',
+            AZURE_AI_FOUNDRY_ENDPOINT: 'https://foundry.example.com/openai/v1/',
+            AZURE_AI_FOUNDRY_API_KEY: 'synthetic-key',
+            WHATSAPP_ACCESS_TOKEN: 'synthetic-token',
+            WHATSAPP_PHONE_NUMBER_ID: '123456789',
+          },
+          stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         },
-        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-      },
-    );
-    t.after(() => {
-      if (child.exitCode === null) {
-        child.kill();
-      }
-    });
-    let output = '';
-    const { stdout, stderr } = child;
-    assert.ok(stdout && stderr);
-    await new Promise<void>((resolve, reject) => {
-      stdout.on('data', (chunk: Buffer) => {
-        output += chunk.toString();
-        if (output.includes('Redis connection error')) {
-          resolve();
+      );
+      t.after(() => {
+        if (child.exitCode === null) {
+          child.kill();
         }
       });
-      stderr.on('data', (chunk: Buffer) => {
-        output += chunk.toString();
+      let output = '';
+      const { stdout, stderr } = child;
+      assert.ok(stdout && stderr);
+      await new Promise<void>((resolve, reject) => {
+        stdout.on('data', (chunk: Buffer) => {
+          output += chunk.toString();
+          if (output.includes('Redis connection error')) {
+            resolve();
+          }
+        });
+        stderr.on('data', (chunk: Buffer) => {
+          output += chunk.toString();
+        });
+        child.once('error', reject);
+        child.once('exit', () => {
+          reject(new Error(`Worker exited before its connection attempt: ${output}`));
+        });
       });
-      child.once('error', reject);
-      child.once('exit', () => {
-        reject(new Error(`Worker exited before its connection attempt: ${output}`));
-      });
-    });
-    const exited = once(child, 'exit');
-    child.send('shutdown');
-    await exited;
-    assert.equal(child.exitCode, 0, output);
-    assert.match(output, /Shutting down/);
-    assert.match(output, /closing worker without waiting for active jobs/);
-    assert.doesNotMatch(output, /Graceful shutdown timed out/);
-  },
-);
+      const exited = once(child, 'exit');
+      child.send('shutdown');
+      await exited;
+      assert.equal(child.exitCode, 0, output);
+      assert.match(output, /Shutting down/);
+      assert.match(output, /closing worker without waiting for active jobs/);
+      assert.doesNotMatch(output, /Graceful shutdown timed out/);
+    },
+  );
+}

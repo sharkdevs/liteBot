@@ -19,6 +19,8 @@ import type { OutgoingMessageJob } from '../../src/shared/types/outgoing-message
 import type { IConversationService } from '../../src/services/conversation.service.js';
 import type { IncomingMessageJob } from '../../src/shared/types/incoming-message-job.js';
 import { createMessageWorker, type MessageProcessor } from '../../src/workers/message.worker.js';
+import { createWhatsAppWorker } from '../../src/workers/whatsapp.worker.js';
+import type { WhatsAppDeliveryService } from '../../src/services/whatsapp-delivery.service.js';
 
 /** A queue under a unique Redis key prefix, removed after the test, plus captured logs. */
 export async function setupQueue(t: TestContext) {
@@ -62,7 +64,9 @@ export async function setupQueue(t: TestContext) {
     connection: inspectionConnection,
     prefix,
   });
-  const workers: ReturnType<typeof createMessageWorker>[] = [];
+  const workers: Array<
+    ReturnType<typeof createMessageWorker> | ReturnType<typeof createWhatsAppWorker>
+  > = [];
   const workerConnections: ReturnType<typeof createRedisConnection>[] = [];
   t.after(async () => {
     try {
@@ -95,6 +99,13 @@ export async function setupQueue(t: TestContext) {
     logs,
     connection,
     settings,
+    startWhatsAppWorker: (delivery: Pick<WhatsAppDeliveryService, 'send' | 'markFailed'>) => {
+      const client = createRedisConnection(settings, logger, 'worker');
+      workerConnections.push(client);
+      const worker = createWhatsAppWorker(client, logger, delivery, { prefix });
+      workers.push(worker);
+      return worker;
+    },
     startWorker: (processMessage: MessageProcessor = () => Promise.resolve()) => {
       const client = createRedisConnection(settings, logger, 'worker');
       workerConnections.push(client);

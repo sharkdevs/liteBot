@@ -60,7 +60,11 @@ export class WhatsAppCloudApiProvider implements IWhatsAppProvider {
       } catch {
         throw new WhatsAppProviderError(
           'WhatsApp returned an unreadable response',
-          response.ok || response.status === 429 || response.status >= 500,
+          controller.signal.aborted ||
+            response.ok ||
+            response.status === 408 ||
+            response.status === 429 ||
+            response.status >= 500,
           response.status,
         );
       }

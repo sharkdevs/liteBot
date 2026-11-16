@@ -222,3 +222,36 @@ await test('a failed outbound save prevents queue publication', async () => {
   );
   await assert.rejects(service.process(job), /Database unavailable/);
 });
+
+await test('incoming replays do not republish already finalized outbound replies', async () => {
+  for (const status of ['SENT', 'FAILED'] as const) {
+    const service = new AiResponseService(
+      {
+        recordInboundMessage: () => Promise.reject(new Error('Unexpected inbound write')),
+        getRecentMessages: () => Promise.reject(new Error('Unexpected history load')),
+        saveOutboundMessage: () => Promise.reject(new Error('Unexpected new reply')),
+        findReplyToMessage: () =>
+          Promise.resolve({
+            id: 'existing-reply',
+            conversationId: job.conversationId,
+            content: 'Private reply',
+            direction: 'OUTBOUND',
+            status,
+            replyToMessageId: job.messageId,
+            whatsappMessageId: status === 'SENT' ? 'wamid.receipt' : null,
+            createdAt: new Date(),
+          }),
+      },
+      {
+        generateResponse: () => Promise.reject(new Error('Unexpected generation')),
+      },
+      'synthetic-model',
+      pino({ level: 'silent' }),
+      {
+        enqueue: () =>
+          Promise.reject(new Error('Finalized replies must not be requeued automatically')),
+      },
+    );
+    await service.process(job);
+  }
+});

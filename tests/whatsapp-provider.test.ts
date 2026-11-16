@@ -70,6 +70,7 @@ await test('Cloud API classifies transient and permanent errors without leaking 
   for (const [status, code, transient] of [
     [503, undefined, true],
     [429, undefined, true],
+    [408, undefined, true],
     [400, 130429, true],
     [400, 131056, true],
     [400, 131000, true],
