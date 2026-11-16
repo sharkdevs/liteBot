@@ -24,6 +24,8 @@ const history: Message[] = [
     conversationId: 'conversation-1',
     whatsappMessageId: null,
     direction: MessageDirection.INBOUND,
+    status: null,
+    replyToMessageId: null,
     content: 'Previous question',
     createdAt: new Date('2026-01-01T00:00:00.000Z'),
   },

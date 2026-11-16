@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { readFile } from 'node:fs/promises';
 import { Writable } from 'node:stream';
 import { test } from 'node:test';
 import { pino } from 'pino';
@@ -7,6 +8,7 @@ import { pino } from 'pino';
 import { WhatsappMessageIdConflictError } from '../src/domain/message/message-id-conflict.error.js';
 import { ConversationRepository } from '../src/repositories/conversation.repository.js';
 import { UserRepository } from '../src/repositories/user.repository.js';
+import { MessageRepository } from '../src/repositories/message.repository.js';
 import { PrismaUnitOfWork, type IUnitOfWork } from '../src/repositories/unit-of-work.js';
 import type { IAiProvider } from '../src/providers/ai/index.js';
 import { AiResponseService } from '../src/services/ai-response.service.js';
@@ -60,6 +62,53 @@ await test('persistence layer', async (t) => {
   t.after(() => database.drop());
 
   await t.test(
+    'status migration preserves existing inbound and unsent Phase 4 messages',
+    async () => {
+      const user = await prisma.user.create({ data: { phoneNumber: syntheticPhoneNumber() } });
+      const conversation = await prisma.conversation.create({
+        data: { userId: user.id, startedAt: new Date() },
+      });
+      const migration = await readFile(
+        new URL(
+          '../prisma/migrations/20261116233000_outbound_message_status/migration.sql',
+          import.meta.url,
+        ),
+        'utf8',
+      );
+      await prisma.$transaction(async (tx) => {
+        // Reconstruct the prior schema only inside this throwaway test database.
+        await tx.$executeRawUnsafe(
+          'ALTER TABLE messages DROP COLUMN status, DROP COLUMN reply_to_message_id',
+        );
+        await tx.$executeRawUnsafe('DROP TYPE message_status');
+        await tx.$executeRaw`
+        INSERT INTO messages (id, conversation_id, direction, content)
+        VALUES ('00000000-0000-4000-8000-000000000001', ${conversation.id}::uuid, 'INBOUND', 'Old inbound'),
+               ('00000000-0000-4000-8000-000000000002', ${conversation.id}::uuid, 'OUTBOUND', 'Old reply')
+      `;
+        for (const statement of migration.split(';').filter((sql) => sql.trim())) {
+          await tx.$executeRawUnsafe(statement);
+        }
+      });
+      const rows = await prisma.message.findMany({
+        where: { conversationId: conversation.id },
+        orderBy: { id: 'asc' },
+      });
+      assert.deepEqual(
+        rows.map(({ content, status, replyToMessageId }) => ({
+          content,
+          status,
+          replyToMessageId,
+        })),
+        [
+          { content: 'Old inbound', status: null, replyToMessageId: null },
+          { content: 'Old reply', status: 'PENDING', replyToMessageId: null },
+        ],
+      );
+    },
+  );
+
+  await t.test(
     'a first message creates a user, a conversation, and an inbound message',
     async () => {
       const { logger, output } = captureLogs();
@@ -85,6 +134,7 @@ await test('persistence layer', async (t) => {
       assert.equal(message.conversationId, conversation.id);
       assert.equal(message.whatsappMessageId, 'wamid.first');
       assert.equal(message.direction, 'INBOUND');
+      assert.equal(message.status, null);
       assert.equal(message.content, 'PRIVATE_MESSAGE_TEXT');
 
       const logs = output();
@@ -96,6 +146,37 @@ await test('persistence layer', async (t) => {
       assert.match(logs, new RegExp(`"messageId":"${message.id}".*"Inbound message saved"`));
       assert.doesNotMatch(logs, /PRIVATE_MESSAGE_TEXT/);
       assert.doesNotMatch(logs, new RegExp(phoneNumber));
+    },
+  );
+
+  await t.test(
+    'outbound receipts persist status and a saved reply is reused per inbound message',
+    async () => {
+      const service = new ConversationService(unitOfWork, pino({ level: 'silent' }));
+      const recorded = await service.recordInboundMessage(
+        inbound(syntheticPhoneNumber(), 'wamid.status'),
+      );
+      const replies = await Promise.all([
+        service.saveOutboundMessage(recorded.conversationId, 'First reply', recorded.messageId),
+        service.saveOutboundMessage(recorded.conversationId, 'Second reply', recorded.messageId),
+      ]);
+      assert.equal(replies[0].id, replies[1].id);
+      assert.equal(replies[0].status, 'PENDING');
+      assert.equal(replies[0].whatsappMessageId, null);
+      assert.equal((await service.findReplyToMessage(recorded.messageId))?.id, replies[0].id);
+
+      const repository = new MessageRepository(prisma);
+      await repository.markSent(replies[0].id, 'wamid.sent-receipt');
+      await repository.markFailed(replies[0].id);
+      const sent = await repository.findById(replies[0].id);
+      assert.equal(sent?.status, 'SENT', 'A stale failure cannot overwrite a recorded acceptance');
+      assert.equal(sent.whatsappMessageId, 'wamid.sent-receipt');
+
+      const failed = await service.saveOutboundMessage(recorded.conversationId, 'Failed reply');
+      await repository.markFailed(failed.id);
+      assert.equal((await repository.findById(failed.id))?.status, 'FAILED');
+      await assert.rejects(repository.markSent(recorded.messageId, 'wamid.invalid-inbound-update'));
+      await assert.rejects(repository.markFailed(recorded.messageId));
     },
   );
 
@@ -255,28 +336,17 @@ await test('persistence layer', async (t) => {
 
   await t.test(
     'a failure while saving the message rolls back the user and conversation',
-    async () => {
+    async (t) => {
       const { logger, output } = captureLogs();
       const failingMessageSave: IUnitOfWork = {
         run: (work) => unitOfWork.run(work),
         runExclusive: (lockKey, work) =>
-          unitOfWork.runExclusive(lockKey, (repositories) =>
-            work({
-              ...repositories,
-              messages: {
-                findByWhatsappMessageId: (id) => repositories.messages.findByWhatsappMessageId(id),
-                findRecentMessagesByConversation: (conversationId, limit, excludeMessageId) =>
-                  repositories.messages.findRecentMessagesByConversation(
-                    conversationId,
-                    limit,
-                    excludeMessageId,
-                  ),
-                saveOutboundMessage: (conversationId, content) =>
-                  repositories.messages.saveOutboundMessage(conversationId, content),
-                create: () => Promise.reject(new Error('Simulated database failure')),
-              },
-            }),
-          ),
+          unitOfWork.runExclusive(lockKey, (repositories) => {
+            t.mock.method(repositories.messages, 'create', () =>
+              Promise.reject(new Error('Simulated database failure')),
+            );
+            return work(repositories);
+          }),
       };
       const service = new ConversationService(failingMessageSave, logger);
       const phoneNumber = syntheticPhoneNumber();

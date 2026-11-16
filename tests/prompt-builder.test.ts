@@ -16,6 +16,8 @@ function message(
     conversationId: 'conversation-1',
     whatsappMessageId: null,
     direction,
+    status: direction === 'OUTBOUND' ? 'PENDING' : null,
+    replyToMessageId: null,
     content,
     createdAt: new Date(createdAt),
   };

@@ -20,6 +20,14 @@ enum MessageDirection {
   @@map("message_direction")
 }
 
+enum MessageStatus {
+  PENDING
+  SENT
+  FAILED
+
+  @@map("message_status")
+}
+
 model User {
   id            String         @id @default(uuid(7)) @db.Uuid
   phoneNumber   String         @unique @map("phone_number")
@@ -65,6 +73,11 @@ model Message {
   // twice; optional, because an outbound reply only gets one after it is sent.
   whatsappMessageId String?          @unique @map("whatsapp_message_id")
   direction         MessageDirection
+  // Delivery status applies only to outbound messages. SENT means accepted by Meta.
+  status            MessageStatus?
+  replyToMessageId  String?          @unique @map("reply_to_message_id") @db.Uuid
+  replyToMessage    Message?         @relation("MessageReply", fields: [replyToMessageId], references: [id], onDelete: Restrict)
+  reply             Message?         @relation("MessageReply")
   content           String
   createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
 

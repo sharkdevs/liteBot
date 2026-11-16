@@ -1,5 +1,10 @@
 import type { DatabaseClient } from '../config/database.js';
-import { MessageDirection, type Message, type NewMessage } from '../domain/message/message.js';
+import {
+  MessageDirection,
+  MessageStatus,
+  type Message,
+  type NewMessage,
+} from '../domain/message/message.js';
 
 export interface IMessageRepository {
   /** Finds a message by Meta's ID, to recognize a webhook that Meta delivered again. */
@@ -9,7 +14,15 @@ export interface IMessageRepository {
     limit: number,
     excludeMessageId?: string,
   ): Promise<Message[]>;
-  saveOutboundMessage(conversationId: string, content: string): Promise<Message>;
+  saveOutboundMessage(
+    conversationId: string,
+    content: string,
+    replyToMessageId?: string,
+  ): Promise<Message>;
+  findReplyToMessage(replyToMessageId: string): Promise<Message | null>;
+  findById(id: string): Promise<Message | null>;
+  markSent(id: string, providerResponseId: string): Promise<void>;
+  markFailed(id: string): Promise<void>;
   create(message: NewMessage): Promise<Message>;
 }
 
@@ -37,16 +50,59 @@ export class MessageRepository implements IMessageRepository {
     return messages.reverse();
   }
 
-  saveOutboundMessage(conversationId: string, content: string): Promise<Message> {
-    return this.create({
+  saveOutboundMessage(
+    conversationId: string,
+    content: string,
+    replyToMessageId?: string,
+  ): Promise<Message> {
+    const data = {
       conversationId,
       whatsappMessageId: null,
       direction: MessageDirection.OUTBOUND,
+      status: MessageStatus.PENDING,
       content,
+      ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
+    };
+    if (replyToMessageId === undefined) {
+      return this.db.message.create({ data });
+    }
+    return this.db.message.upsert({ where: { replyToMessageId }, create: data, update: {} });
+  }
+
+  findReplyToMessage(replyToMessageId: string): Promise<Message | null> {
+    return this.db.message.findUnique({ where: { replyToMessageId } });
+  }
+
+  findById(id: string): Promise<Message | null> {
+    return this.db.message.findUnique({ where: { id } });
+  }
+
+  async markSent(id: string, providerResponseId: string): Promise<void> {
+    await this.db.message.update({
+      where: { id, direction: MessageDirection.OUTBOUND },
+      data: { status: MessageStatus.SENT, whatsappMessageId: providerResponseId },
     });
   }
 
+  async markFailed(id: string): Promise<void> {
+    const result = await this.db.message.updateMany({
+      where: { id, direction: MessageDirection.OUTBOUND, status: { not: MessageStatus.SENT } },
+      data: { status: MessageStatus.FAILED },
+    });
+    if (result.count === 0) {
+      // Only a previously recorded acceptance may make this a no-op.
+      await this.db.message.findUniqueOrThrow({
+        where: { id, direction: MessageDirection.OUTBOUND, status: MessageStatus.SENT },
+      });
+    }
+  }
+
   create(message: NewMessage): Promise<Message> {
-    return this.db.message.create({ data: message });
+    return this.db.message.create({
+      data: {
+        ...message,
+        status: message.direction === MessageDirection.OUTBOUND ? MessageStatus.PENDING : null,
+      },
+    });
   }
 }

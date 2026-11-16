@@ -30,7 +30,15 @@ export interface IConversationService {
     limit: number,
     excludeMessageId?: string,
   ): Promise<Message[]>;
-  saveOutboundMessage(conversationId: string, content: string): Promise<Message>;
+  saveOutboundMessage(
+    conversationId: string,
+    content: string,
+    replyToMessageId?: string,
+  ): Promise<Message>;
+}
+
+export interface IAiConversationService extends IConversationService {
+  findReplyToMessage(replyToMessageId: string): Promise<Message | null>;
 }
 
 export class ConversationService implements IConversationService {
@@ -123,9 +131,17 @@ export class ConversationService implements IConversationService {
     );
   }
 
-  saveOutboundMessage(conversationId: string, content: string): Promise<Message> {
+  saveOutboundMessage(
+    conversationId: string,
+    content: string,
+    replyToMessageId?: string,
+  ): Promise<Message> {
     return this.unitOfWork.run(({ messages }) =>
-      messages.saveOutboundMessage(conversationId, content),
+      messages.saveOutboundMessage(conversationId, content, replyToMessageId),
     );
+  }
+
+  findReplyToMessage(replyToMessageId: string): Promise<Message | null> {
+    return this.unitOfWork.run(({ messages }) => messages.findReplyToMessage(replyToMessageId));
   }
 }
