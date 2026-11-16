@@ -1,9 +1,15 @@
+/** What the webhook hands to the worker for one saved inbound text message. */
 export interface IncomingMessageJob {
-  phoneNumber: string;
+  correlationId: string;
+  /** Our database ID for the saved message; also used as the BullMQ job ID. */
   messageId: string;
+  userId: string;
+  conversationId: string;
+  /** Meta's message ID (`wamid...`). */
+  whatsappMessageId: string;
+  phoneNumber: string;
   messageText: string;
   timestamp: string;
-  correlationId: string;
 }
 
 export interface IncomingMessageQueuePort {

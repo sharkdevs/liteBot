@@ -35,6 +35,9 @@ await test('health returns the Stage 1 response without database or Redis connec
   const server = createApp({
     logger: createLogger('silent'),
     whatsappVerifyToken: 'test-verification-token',
+    conversationService: {
+      recordInboundMessage: () => Promise.reject(new Error('Health requests must not save data')),
+    },
     incomingMessageQueue: {
       enqueue: () => Promise.reject(new Error('Health requests must not enqueue jobs')),
     },
@@ -71,6 +74,7 @@ await test('an occupied port produces an error and a nonzero exit, not a success
           PORT: String(address.port),
           LOG_LEVEL: 'info',
           WHATSAPP_VERIFY_TOKEN: 'test-verification-token',
+          DATABASE_URL: 'postgresql://litebot:litebot@127.0.0.1:1/litebot',
           REDIS_HOST: '127.0.0.1',
           REDIS_PORT: '1',
         },
