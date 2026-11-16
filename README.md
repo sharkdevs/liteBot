@@ -72,6 +72,9 @@ the slow work will happen elsewhere. The two can then be scaled independently.
 The minimum matches ESLint's supported Node versions. Docker is optional for this
 phase: neither the server nor its tests connect to PostgreSQL or Redis.
 
+For step 3 below, follow [Generate your verification token](#generate-your-verification-token)
+for the exact command and `.env` instructions.
+
 ```powershell
 # 1. Install dependencies
 npm ci
@@ -79,7 +82,7 @@ npm ci
 # 2. Create your local environment file only if it does not already exist
 Copy-Item .env.example .env        # macOS/Linux: cp .env.example .env
 
-# 3. Edit .env and set WHATSAPP_VERIFY_TOKEN to your own non-empty token.
+# 3. Generate a private token and save it as WHATSAPP_VERIFY_TOKEN in .env.
 #    An existing .env from the bootstrap stage needs this new setting too.
 
 # 4. Run the API with auto-reload
@@ -147,6 +150,48 @@ it for this subscription. Choose a private `WHATSAPP_VERIFY_TOKEN` in `.env` and
 enter the same value in Meta's webhook configuration. This is a token **you
 choose**, not the WhatsApp access token used for sending messages.
 
+### Generate your verification token
+
+Generate it **on your own computer**, not on an online token-generator website.
+In a PowerShell terminal, run:
+
+```powershell
+node --input-type=module -e "import { randomBytes } from 'node:crypto'; process.stdout.write(randomBytes(32).toString('hex') + '\n')"
+```
+
+This uses Node's built-in
+[`crypto.randomBytes`](https://nodejs.org/docs/latest-v22.x/api/crypto.html#cryptorandombytessize-callback)
+to generate 32 cryptographically random bytes, displayed as **64 hexadecimal
+characters** (`0`-`9` and `a`-`f`). No additional package is needed.
+The command only prints the value; it does not edit `.env` or configure Meta.
+The 64-character length is a recommendation, not a length enforced by our app.
+
+1. Copy the entire output line. Open your existing `.env` in the project root
+   and replace the value on its `WHATSAPP_VERIFY_TOKEN=` line. Do not add a
+   second copy of that setting or overwrite your other settings:
+
+   ```dotenv
+   WHATSAPP_VERIFY_TOKEN=PASTE_THE_64_CHARACTER_OUTPUT_HERE
+   ```
+
+2. Replace that placeholder with the generated value, with no surrounding
+   spaces or quotes, and save `.env`. If the server is running, stop it with
+   Ctrl+C, then run `npm run dev` again so it reads the new value.
+3. When [configuring the callback in Meta](#connect-to-the-meta-dashboard), paste
+   **the same generated value** into **Verify token**. Paste only the value,
+   not the `WHATSAPP_VERIFY_TOKEN=` prefix. Do not generate another value for
+   this field. Click **Verify and save** with your server and tunnel running.
+
+Generate once and reuse that value across server restarts. It is not a WhatsApp
+access token, ngrok authtoken, Meta app secret, or `hub.challenge`.
+Keep it in your private `.env`; do not commit it, put it in `.env.example`, or
+share it in chat, screenshots, or terminal transcripts.
+
+If it is exposed or you need to replace it, generate a new value, update `.env`,
+restart the server, update Meta's **Verify token**, and **Verify and save** again.
+Changing only one side causes verification to fail with `403`.
+This token verifies the GET handshake; it does not authenticate POST events.
+
 ### How challenge-response works
 
 Meta sends `GET /webhook` with three query parameters:
@@ -162,12 +207,16 @@ A wrong or missing token, or a wrong mode, gets `403`. A matching token with
 a missing, empty, or repeated challenge gets `400`. Startup fails clearly
 if the configured token is missing or blank.
 
-For a local example, set `.env` to `WHATSAPP_VERIFY_TOKEN=local-example-token`
-(only a demonstration value), restart the server, and run:
+To check the handshake locally, keep the generated token in `.env` and start
+the server. In a second terminal, run the following and paste only the token
+value when prompted. This does not change your token or contact Meta:
 
 ```powershell
-Invoke-RestMethod 'http://localhost:3000/webhook?hub.mode=subscribe&hub.verify_token=local-example-token&hub.challenge=123456'
+$verifyToken = Read-Host 'Paste the WHATSAPP_VERIFY_TOKEN value from your .env'
+$encodedToken = [uri]::EscapeDataString($verifyToken)
+Invoke-RestMethod "http://localhost:3000/webhook?hub.mode=subscribe&hub.verify_token=$encodedToken&hub.challenge=123456"
 # 123456
+Remove-Variable verifyToken, encodedToken
 ```
 
 ### GET versus POST
@@ -254,15 +303,11 @@ to use the dashboard's `messages` sample test.
 Complete [Local setup](#local-setup) first if you have not installed the
 dependencies and created `.env`.
 
-Edit your existing `.env` without overwriting other settings:
-
-```dotenv
-PORT=3000
-WHATSAPP_VERIFY_TOKEN=replace-with-your-own-private-token
-```
-
-Replace the example token with a private value of your own. Keep it out of Git,
-chat, and screenshots. Start or restart the server so it reads that value:
+Follow [Generate your verification token](#generate-your-verification-token)
+to create and save the value in `.env`. If you already did that, reuse the
+existing value; do not generate a different one for the dashboard.
+The following examples use the default `PORT=3000`.
+Start or restart the server so it reads your saved settings:
 
 ```powershell
 npm run dev

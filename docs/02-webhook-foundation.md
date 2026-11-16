@@ -27,8 +27,9 @@ Meta should not accept an arbitrary URL merely because someone typed it into a
 dashboard. The owner of that URL must demonstrate that they intentionally
 configured an endpoint that understands the subscription handshake.
 
-1. Choose a private, non-empty verification token and put it in
-   `WHATSAPP_VERIFY_TOKEN` in `.env`.
+1. [Generate a private verification token](../README.md#generate-your-verification-token)
+   using Node's built-in cryptographic generator, put it in
+   `WHATSAPP_VERIFY_TOKEN` in `.env`, and restart the server.
 2. Configure the callback URL and the same token in Meta's dashboard.
 3. Meta sends a GET request containing `hub.mode=subscribe`,
    `hub.verify_token`, and `hub.challenge`.
@@ -43,6 +44,14 @@ be the same response.
 The verification token is chosen by us. It is different from a WhatsApp access
 token, which authorizes API calls, and from the Meta app secret used to verify
 delivery signatures.
+
+The linked walkthrough generates 32 random bytes and displays them as 64
+hexadecimal characters. This avoids guessable values without installing a
+package. Generate it once, then copy the same value into `.env` and the
+dashboard's **Verify token** field; Meta does not issue this token for us.
+If you replace it later, update both places, restart the server, and verify
+again. The README's local handshake example reuses it rather than replacing
+it with a fixed demonstration token.
 
 | Verification input                                                          | Result                                              |
 | --------------------------------------------------------------------------- | --------------------------------------------------- |
