@@ -1,5 +1,6 @@
 import type { Logger } from 'pino';
 
+import { WhatsappMessageIdConflictError } from '../domain/message/message-id-conflict.error.js';
 import { MessageDirection } from '../domain/message/message.js';
 import type { IUnitOfWork } from '../repositories/unit-of-work.js';
 
@@ -39,63 +40,64 @@ export class ConversationService implements IConversationService {
       `sender:${phoneNumber}`,
       async ({ users, conversations, messages }) => {
         const existingUser = await users.findByPhoneNumber(phoneNumber);
-        const user = existingUser ?? (await users.create({ phoneNumber }));
 
+        // Meta can deliver the same webhook more than once; a redelivery saves nothing new.
+        const existingMessage = await messages.findByWhatsappMessageId(whatsappMessageId);
+        if (existingMessage) {
+          const owner = await conversations.findById(existingMessage.conversationId);
+          if (existingUser === null || owner?.userId !== existingUser.id) {
+            throw new WhatsappMessageIdConflictError();
+          }
+          return { userId: existingUser.id, message: existingMessage, duplicate: true } as const;
+        }
+
+        const user = existingUser ?? (await users.create({ phoneNumber }));
         const latestConversation = await conversations.findLatestForUser(user.id);
         const conversation =
           latestConversation ?? (await conversations.create({ userId: user.id }));
-
-        // Meta can deliver the same webhook more than once; save each message only once.
-        const existingMessage = await messages.findByWhatsappMessageId(whatsappMessageId);
-        const message =
-          existingMessage ??
-          (await messages.create({
-            conversationId: conversation.id,
-            whatsappMessageId,
-            direction: MessageDirection.INBOUND,
-            content,
-          }));
+        const message = await messages.create({
+          conversationId: conversation.id,
+          whatsappMessageId,
+          direction: MessageDirection.INBOUND,
+          content,
+        });
 
         return {
           userId: user.id,
           userCreated: existingUser === null,
-          conversationId: conversation.id,
           conversationCreated: latestConversation === null,
           message,
-          duplicate: existingMessage !== null,
-        };
+          duplicate: false,
+        } as const;
       },
     );
 
     // Logged only after the transaction commits, so every log describes saved data.
-    const { userId, conversationId, message, duplicate } = saved;
-    if (saved.userCreated) {
-      this.logger.info({ correlationId, userId }, 'User created');
-    } else {
-      this.logger.debug({ correlationId, userId }, 'Existing user found');
-    }
-    if (saved.conversationCreated) {
-      this.logger.info({ correlationId, userId, conversationId }, 'Conversation created');
-    } else {
-      this.logger.debug({ correlationId, userId, conversationId }, 'Latest conversation found');
-    }
+    const { userId, message } = saved;
+    const conversationId = message.conversationId;
     const messageContext = {
       correlationId,
       userId,
-      conversationId: message.conversationId,
+      conversationId,
       messageId: message.id,
       whatsappMessageId,
     };
-    this.logger.info(
-      messageContext,
-      duplicate ? 'Inbound message already saved' : 'Inbound message saved',
-    );
+    if (saved.duplicate) {
+      this.logger.info(messageContext, 'Inbound message already saved');
+    } else {
+      if (saved.userCreated) {
+        this.logger.info({ correlationId, userId }, 'User created');
+      } else {
+        this.logger.debug({ correlationId, userId }, 'Existing user found');
+      }
+      if (saved.conversationCreated) {
+        this.logger.info({ correlationId, userId, conversationId }, 'Conversation created');
+      } else {
+        this.logger.debug({ correlationId, userId, conversationId }, 'Latest conversation found');
+      }
+      this.logger.info(messageContext, 'Inbound message saved');
+    }
 
-    return {
-      userId,
-      conversationId: message.conversationId,
-      messageId: message.id,
-      duplicate,
-    };
+    return { userId, conversationId, messageId: message.id, duplicate: saved.duplicate };
   }
 }

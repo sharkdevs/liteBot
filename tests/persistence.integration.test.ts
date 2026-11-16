@@ -4,6 +4,7 @@ import { Writable } from 'node:stream';
 import { test } from 'node:test';
 import { pino } from 'pino';
 
+import { WhatsappMessageIdConflictError } from '../src/domain/message/message-id-conflict.error.js';
 import { ConversationRepository } from '../src/repositories/conversation.repository.js';
 import { UserRepository } from '../src/repositories/user.repository.js';
 import { PrismaUnitOfWork, type IUnitOfWork } from '../src/repositories/unit-of-work.js';
@@ -121,6 +122,38 @@ await test('persistence layer', async (t) => {
     );
     assert.match(output(), /Inbound message already saved/);
   });
+
+  await t.test(
+    'a message ID already saved for another sender is refused without saving anything',
+    async () => {
+      const service = new ConversationService(unitOfWork, pino({ level: 'silent' }));
+      const original = await service.recordInboundMessage(
+        inbound(syntheticPhoneNumber(), 'wamid.claimed'),
+      );
+      const newSender = syntheticPhoneNumber();
+      const existingSender = syntheticPhoneNumber();
+      const existing = await service.recordInboundMessage(
+        inbound(existingSender, 'wamid.existing-sender'),
+      );
+
+      for (const phoneNumber of [newSender, existingSender]) {
+        await assert.rejects(
+          service.recordInboundMessage(inbound(phoneNumber, 'wamid.claimed')),
+          WhatsappMessageIdConflictError,
+        );
+      }
+
+      assert.equal(await prisma.user.count({ where: { phoneNumber: newSender } }), 0);
+      assert.equal(
+        await prisma.message.count({ where: { conversationId: existing.conversationId } }),
+        1,
+      );
+      const claimed = await prisma.message.findUniqueOrThrow({
+        where: { whatsappMessageId: 'wamid.claimed' },
+      });
+      assert.equal(claimed.id, original.messageId);
+    },
+  );
 
   await t.test(
     'simultaneous first messages from one sender create one user and one conversation',
