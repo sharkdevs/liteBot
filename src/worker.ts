@@ -11,7 +11,17 @@ const worker = createMessageWorker(connection, logger);
 
 registerShutdown(logger, async () => {
   try {
-    await worker.close();
+    if (connection.status === 'ready') {
+      await worker.close();
+    } else {
+      // A graceful close waits for Redis indefinitely. An interrupted job's
+      // lock expires, so BullMQ's stalled-job check can return it to the queue.
+      logger.warn(
+        { redisStatus: connection.status },
+        'Redis is not ready; closing worker without waiting for active jobs',
+      );
+      await worker.close(true);
+    }
   } finally {
     connection.disconnect();
   }
