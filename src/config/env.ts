@@ -31,6 +31,16 @@ export interface WorkerEnv extends RuntimeEnv {
   readonly ai: AiSettings;
 }
 
+export interface WhatsAppSettings {
+  readonly accessToken: string;
+  readonly phoneNumberId: string;
+}
+
+export interface WhatsAppWorkerEnv extends RuntimeEnv {
+  readonly databaseUrl: string;
+  readonly whatsapp: WhatsAppSettings;
+}
+
 export interface Env extends RuntimeEnv {
   readonly port: number;
   readonly whatsappVerifyToken: string;
@@ -155,5 +165,21 @@ export function loadApiEnv(source: NodeJS.ProcessEnv = process.env): Env {
     whatsappVerifyToken: parseVerifyToken(source.WHATSAPP_VERIFY_TOKEN),
     ...loadRuntimeEnv(source),
     databaseUrl: parseDatabaseUrl(source.DATABASE_URL),
+  });
+}
+
+export function loadWhatsAppWorkerEnv(source: NodeJS.ProcessEnv = process.env): WhatsAppWorkerEnv {
+  const accessToken = source.WHATSAPP_ACCESS_TOKEN?.trim();
+  const phoneNumberId = source.WHATSAPP_PHONE_NUMBER_ID?.trim();
+  if (!accessToken || !/^[!-~]+$/.test(accessToken)) {
+    throw new Error('WHATSAPP_ACCESS_TOKEN must be a non-empty token without whitespace');
+  }
+  if (!phoneNumberId || !/^[0-9]+$/.test(phoneNumberId)) {
+    throw new Error('WHATSAPP_PHONE_NUMBER_ID must be a numeric business phone number ID');
+  }
+  return Object.freeze({
+    ...loadRuntimeEnv(source),
+    databaseUrl: parseDatabaseUrl(source.DATABASE_URL),
+    whatsapp: Object.freeze({ accessToken, phoneNumberId }),
   });
 }
