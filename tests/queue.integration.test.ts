@@ -6,6 +6,7 @@ import { test, type TestContext } from 'node:test';
 import { promisify } from 'node:util';
 import { Queue, RedisConnection } from 'bullmq';
 import { pino } from 'pino';
+import { createClient } from 'redis';
 
 import { createApp } from '../src/app.js';
 import { createRedisConnection } from '../src/config/redis.js';
@@ -72,6 +73,7 @@ async function setupQueue(t: TestContext) {
     logger,
     logs,
     connection,
+    settings,
     startWorker: () => {
       const client = createRedisConnection(settings, logger, 'worker');
       workerConnections.push(client);
@@ -179,6 +181,26 @@ await test(
     assert.deepEqual(await response.json(), { error: 'Internal server error' });
     assert.equal(await fixture.inspector.getWaitingCount(), 0);
     assert.doesNotMatch(fixture.logs.join(''), /Incoming message queued/);
+  },
+);
+
+await test(
+  'the producer keeps accepting messages after Redis loses its Lua scripts',
+  { timeout: 15_000 },
+  async (t) => {
+    const { queue, inspector, settings } = await setupQueue(t);
+    await queue.enqueue([message]);
+    // A Redis restart empties its script cache; SCRIPT FLUSH does the same without deleting data.
+    const admin = createClient({ socket: settings });
+    await admin.connect();
+    try {
+      await admin.scriptFlush();
+    } finally {
+      admin.destroy();
+    }
+
+    await queue.enqueue([{ ...message, messageId: 'wamid.after-script-flush' }]);
+    assert.equal(await inspector.getWaitingCount(), 2);
   },
 );
 

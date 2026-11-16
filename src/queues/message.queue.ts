@@ -40,23 +40,33 @@ export class IncomingMessageQueue implements IncomingMessageQueuePort {
     if (this.connection.status !== 'ready') {
       throw new Error('Incoming message queue Redis connection is not ready');
     }
+    let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const jobs = await Promise.race([
-        this.queue.addBulk(messages.map((data) => ({ name: INCOMING_MESSAGE_JOB_NAME, data }))),
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => {
-            reject(new Error('Timed out accepting incoming messages'));
-          }, QUEUE_ADD_TIMEOUT_MS);
-        }),
-      ]);
-      for (const job of jobs) {
-        const { correlationId, phoneNumber, messageId } = job.data;
+    // Add jobs one at a time, in order. BullMQ's node-redis addBulk cannot reload
+    // its Lua scripts after a Redis restart, while a single add falls back to EVAL.
+    const addInOrder = async () => {
+      for (const data of messages) {
+        if (timedOut) {
+          return;
+        }
+        const job = await this.queue.add(INCOMING_MESSAGE_JOB_NAME, data);
+        const { correlationId, phoneNumber, messageId } = data;
         this.logger.info(
           { correlationId, jobId: job.id, phoneNumber, messageId },
           'Incoming message queued',
         );
       }
+    };
+    try {
+      await Promise.race([
+        addInOrder(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error('Timed out accepting incoming messages'));
+          }, QUEUE_ADD_TIMEOUT_MS);
+        }),
+      ]);
     } finally {
       clearTimeout(timer);
     }
