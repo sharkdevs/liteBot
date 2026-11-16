@@ -1,137 +1,36 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { Writable } from 'node:stream';
-import { test, type TestContext } from 'node:test';
-import { promisify } from 'node:util';
-import { Queue, RedisConnection } from 'bullmq';
-import { pino } from 'pino';
+import { test } from 'node:test';
 import { createClient } from 'redis';
 
-import { createApp } from '../src/app.js';
-import { createRedisConnection } from '../src/config/redis.js';
-import { IncomingMessageQueue } from '../src/queues/message.queue.js';
-import { INCOMING_MESSAGE_QUEUE_NAME } from '../src/queues/queue.constants.js';
+import type { IConversationService } from '../src/services/conversation.service.js';
 import type { IncomingMessageJob } from '../src/shared/types/incoming-message-job.js';
-import { createMessageWorker } from '../src/workers/message.worker.js';
+import { setupQueue, startWebhook, textMessageWebhook } from './support/queue-fixture.js';
 
-async function setupQueue(t: TestContext) {
-  const prefix = `litebot-test-${randomUUID()}`;
-  const logs: string[] = [];
-  const logger = pino(
-    {},
-    new Writable({
-      write(chunk: Buffer, _encoding, callback) {
-        logs.push(chunk.toString());
-        callback();
-      },
-    }),
-  );
-  const settings = { host: '127.0.0.1', port: Number(process.env.TEST_REDIS_PORT ?? '6379') };
-  const connection = createRedisConnection(settings, logger, 'producer');
-  let readyTimeout: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      RedisConnection.waitUntilReady(connection),
-      new Promise<never>((_resolve, reject) => {
-        readyTimeout = setTimeout(() => {
-          reject(new Error('Redis integration tests require a reachable local Redis server'));
-        }, 5000);
-      }),
-    ]);
-  } catch (error) {
-    connection.disconnect();
-    throw error;
-  } finally {
-    clearTimeout(readyTimeout);
-  }
-  const inspectionConnection = createRedisConnection(settings, logger, 'producer');
-  const queue = new IncomingMessageQueue(connection, logger, { prefix });
-  const inspector = new Queue<IncomingMessageJob>(INCOMING_MESSAGE_QUEUE_NAME, {
-    connection: inspectionConnection,
-    prefix,
-  });
-  const workers: ReturnType<typeof createMessageWorker>[] = [];
-  const workerConnections: ReturnType<typeof createRedisConnection>[] = [];
-  t.after(async () => {
-    try {
-      await Promise.all(workers.map((worker) => worker.close()));
-      await inspector.obliterate();
-      await Promise.all([queue.close(), inspector.close()]);
-    } finally {
-      connection.disconnect();
-      inspectionConnection.disconnect();
-      workerConnections.forEach((client) => {
-        client.disconnect();
-      });
-    }
-  });
-  await inspector.waitUntilReady();
-  return {
-    queue,
-    inspector,
-    logger,
-    logs,
-    connection,
-    settings,
-    startWorker: () => {
-      const client = createRedisConnection(settings, logger, 'worker');
-      workerConnections.push(client);
-      const worker = createMessageWorker(client, logger, { prefix });
-      workers.push(worker);
-      return worker;
-    },
-  };
-}
-
-async function startWebhook(t: TestContext, fixture: Awaited<ReturnType<typeof setupQueue>>) {
-  const server = createApp({
-    logger: fixture.logger,
-    whatsappVerifyToken: 'integration-verification-token',
-    incomingMessageQueue: fixture.queue,
-  }).listen(0, '127.0.0.1');
-  t.after(async () => {
-    await promisify(server.close.bind(server))();
-  });
-  await once(server, 'listening');
-  const address = server.address();
-  assert.ok(address && typeof address !== 'string');
-  return `http://127.0.0.1:${String(address.port)}/webhook`;
-}
-
+// IDs that a real database would have assigned; this file tests Redis, not PostgreSQL.
 const message: IncomingMessageJob = {
+  correlationId: 'queue-test-correlation',
+  messageId: 'message-queue-test',
+  userId: 'user-queue-test',
+  conversationId: 'conversation-queue-test',
+  whatsappMessageId: 'wamid.queue-test',
   phoneNumber: '15550000001',
-  messageId: 'wamid.queue-test',
   messageText: 'PRIVATE_MESSAGE_TEXT',
   timestamp: '1794844800',
-  correlationId: 'queue-test-correlation',
+};
+
+const savedMessage: IConversationService = {
+  recordInboundMessage: () =>
+    Promise.resolve({
+      userId: message.userId,
+      conversationId: message.conversationId,
+      messageId: message.messageId,
+      duplicate: false,
+    }),
 };
 
 function webhookBody() {
-  return JSON.stringify({
-    object: 'whatsapp_business_account',
-    entry: [
-      {
-        id: 'synthetic-business',
-        changes: [
-          {
-            field: 'messages',
-            value: {
-              messages: [
-                {
-                  id: message.messageId,
-                  from: message.phoneNumber,
-                  type: 'text',
-                  text: { body: message.messageText },
-                  timestamp: message.timestamp,
-                },
-              ],
-            },
-          },
-        ],
-      },
-    ],
-  });
+  return textMessageWebhook(message);
 }
 
 await test(
@@ -139,7 +38,7 @@ await test(
   { timeout: 15_000 },
   async (t) => {
     const fixture = await setupQueue(t);
-    const url = await startWebhook(t, fixture);
+    const url = await startWebhook(t, fixture, savedMessage);
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-correlation-id': message.correlationId },
@@ -169,7 +68,7 @@ await test(
   { timeout: 15_000 },
   async (t) => {
     const fixture = await setupQueue(t);
-    const url = await startWebhook(t, fixture);
+    const url = await startWebhook(t, fixture, savedMessage);
     fixture.connection.disconnect();
     const response = await fetch(url, {
       method: 'POST',
@@ -199,8 +98,21 @@ await test(
       admin.destroy();
     }
 
-    await queue.enqueue([{ ...message, messageId: 'wamid.after-script-flush' }]);
+    await queue.enqueue([{ ...message, messageId: 'message-after-script-flush' }]);
     assert.equal(await inspector.getWaitingCount(), 2);
+  },
+);
+
+await test(
+  'enqueueing the same saved message twice keeps one job',
+  { timeout: 15_000 },
+  async (t) => {
+    const { queue, inspector } = await setupQueue(t);
+    await queue.enqueue([message]);
+    await queue.enqueue([message]);
+    const waiting = await inspector.getWaiting();
+    assert.equal(waiting.length, 1);
+    assert.equal(waiting[0]?.id, message.messageId);
   },
 );
 
@@ -223,8 +135,9 @@ await test(
     assert.match(output, /Incoming message payload received/);
     assert.match(output, /Incoming message processing completed/);
     assert.match(output, /"correlationId":"queue-test-correlation"/);
-    assert.match(output, /"messageId":"wamid.queue-test"/);
-    assert.match(output, /"jobId":"\d+"/);
+    assert.match(output, /"jobId":"message-queue-test"/);
+    assert.match(output, /"userId":"user-queue-test","conversationId":"conversation-queue-test"/);
+    assert.match(output, /"messageId":"message-queue-test","whatsappMessageId":"wamid.queue-test"/);
     assert.doesNotMatch(output, /PRIVATE_MESSAGE_TEXT/);
   },
 );

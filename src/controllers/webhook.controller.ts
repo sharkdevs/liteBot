@@ -2,16 +2,24 @@ import type { Request, Response } from 'express';
 import type { Logger } from 'pino';
 
 import { getCorrelationId } from '../middleware/request-id.middleware.js';
+import type { IConversationService } from '../services/conversation.service.js';
 import type {
   IncomingMessageJob,
   IncomingMessageQueuePort,
 } from '../shared/types/incoming-message-job.js';
+import { unixSecondsToDate } from '../shared/utils/unix-time.js';
 import { parseWebhookPayload } from '../shared/utils/webhook-validation.js';
+
+type AcceptedMessage = Pick<
+  IncomingMessageJob,
+  'phoneNumber' | 'whatsappMessageId' | 'messageText' | 'timestamp'
+>;
 
 export class WebhookController {
   constructor(
     private readonly verifyToken: string,
     private readonly logger: Logger,
+    private readonly conversationService: IConversationService,
     private readonly incomingMessageQueue: IncomingMessageQueuePort,
   ) {}
 
@@ -55,7 +63,7 @@ export class WebhookController {
       { correlationId, eventType: 'webhook_received', entryCount: payload.entry.length },
       'WhatsApp webhook payload received',
     );
-    const jobs: IncomingMessageJob[] = [];
+    const accepted: AcceptedMessage[] = [];
 
     for (const entry of payload.entry) {
       for (const change of entry.changes) {
@@ -72,7 +80,7 @@ export class WebhookController {
             correlationId,
             eventType: change.field,
             phoneNumber: message.from,
-            messageId: message.id,
+            whatsappMessageId: message.id,
           };
           this.logger.info(context, 'WhatsApp webhook event received');
           if (
@@ -82,10 +90,9 @@ export class WebhookController {
             message.text &&
             message.timestamp
           ) {
-            jobs.push({
-              correlationId,
+            accepted.push({
               phoneNumber: message.from,
-              messageId: message.id,
+              whatsappMessageId: message.id,
               messageText: message.text.body,
               timestamp: message.timestamp,
             });
@@ -100,6 +107,20 @@ export class WebhookController {
           }
         }
       }
+    }
+
+    // Save first, then queue, so every job refers to a message that is already stored.
+    const jobs: IncomingMessageJob[] = [];
+    for (const message of accepted) {
+      const { userId, conversationId, messageId } =
+        await this.conversationService.recordInboundMessage({
+          correlationId,
+          phoneNumber: message.phoneNumber,
+          whatsappMessageId: message.whatsappMessageId,
+          whatsappTimestamp: unixSecondsToDate(message.timestamp),
+          content: message.messageText,
+        });
+      jobs.push({ correlationId, messageId, userId, conversationId, ...message });
     }
 
     if (jobs.length > 0) {

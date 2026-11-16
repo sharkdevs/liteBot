@@ -49,10 +49,24 @@ export class IncomingMessageQueue implements IncomingMessageQueuePort {
         if (timedOut) {
           return;
         }
-        const job = await this.queue.add(INCOMING_MESSAGE_JOB_NAME, data);
-        const { correlationId, phoneNumber, messageId } = data;
+        // The database message ID doubles as the job ID: adding a job whose ID is already
+        // in Redis does nothing, so a redelivered webhook is not queued twice.
+        // https://docs.bullmq.io/guide/jobs/job-ids
+        const job = await this.queue.add(INCOMING_MESSAGE_JOB_NAME, data, {
+          jobId: data.messageId,
+        });
+        const { correlationId, userId, conversationId, messageId, whatsappMessageId, phoneNumber } =
+          data;
         this.logger.info(
-          { correlationId, jobId: job.id, phoneNumber, messageId },
+          {
+            correlationId,
+            jobId: job.id,
+            userId,
+            conversationId,
+            messageId,
+            whatsappMessageId,
+            phoneNumber,
+          },
           'Incoming message queued',
         );
       }

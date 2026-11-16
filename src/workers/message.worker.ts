@@ -10,8 +10,17 @@ import type { IncomingMessageJob } from '../shared/types/incoming-message-job.js
 type MessageJob = Job<IncomingMessageJob, void, typeof INCOMING_MESSAGE_JOB_NAME>;
 
 function logContext(job: MessageJob) {
-  const { correlationId, phoneNumber, messageId } = job.data;
-  return { correlationId, jobId: job.id, phoneNumber, messageId };
+  const { correlationId, userId, conversationId, messageId, whatsappMessageId, phoneNumber } =
+    job.data;
+  return {
+    correlationId,
+    jobId: job.id,
+    userId,
+    conversationId,
+    messageId,
+    whatsappMessageId,
+    phoneNumber,
+  };
 }
 
 export function createMessageWorker(

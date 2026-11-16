@@ -33,22 +33,38 @@ npm run build             # tsc -p tsconfig.build.json → dist/
 npm start                 # node dist/server.js
 npm run start:worker      # node dist/worker.js
 npm run typecheck         # tsc --noEmit (tsx does not type-check)
-npm test                  # Node's built-in runner, using tsx for TypeScript (no Redis)
-npm run test:integration  # real BullMQ against local Redis (TEST_REDIS_PORT, default 6379)
+npm test                  # Node's built-in runner, using tsx for TypeScript (no Redis or PostgreSQL)
+npm run test:integration  # real BullMQ (Redis) and real persistence (PostgreSQL, throwaway DB)
 node --import tsx --test --test-name-pattern="occupied port" tests/bootstrap.test.ts
 node --import tsx --test --test-name-pattern="verification echoes" tests/webhook.test.ts
+node --import tsx --test --test-name-pattern="simultaneous" tests/persistence.integration.test.ts
 npm run lint              # ESLint with typescript-eslint strictTypeChecked
 npm run format:check      # Prettier
 npm run prisma:generate   # generates src/generated/prisma (gitignored)
+npm run prisma:migrate:deploy # applies committed migrations (prisma migrate deploy)
+npm run prisma:migrate -- --name <name> --create-only # new draft migration (interactive terminal only)
 docker compose up -d --wait   # PostgreSQL 18 + Redis 8
 ```
 
 `npm test` (bootstrap, webhook, config) needs no database or Redis; webhook tests
-inject an in-memory queue. `npm run test:integration` needs Redis
-(`docker compose up -d --wait redis`); each test uses a random BullMQ key prefix
-and deletes only its own keys. Never flush or stop the shared Compose Redis from
-tests. API startup requires a non-empty `WHATSAPP_VERIFY_TOKEN`; tests inject
-synthetic configuration. Put Node test-runner options before file names.
+inject a fake conversation service and an in-memory queue.
+`npm run test:integration` needs Redis and PostgreSQL (`docker compose up -d --wait`).
+Queue tests use a random BullMQ key prefix and delete only their own keys;
+persistence tests create a `litebot_test_<hex>` database via `TEST_DATABASE_URL`,
+apply migrations with `prisma migrate deploy`, and drop it afterwards. Never
+flush or stop the shared Compose Redis or touch the development database from
+tests. API startup requires a non-empty `WHATSAPP_VERIFY_TOKEN` and a PostgreSQL
+`DATABASE_URL`; tests inject synthetic configuration. Put Node test-runner
+options before file names.
+
+`prisma migrate dev` refuses non-interactive shells. To draft a migration
+there, print SQL with
+`npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --script`
+(compares the `DATABASE_URL` database to the schema), save it in a new
+timestamped `prisma/migrations/<UTC timestamp>_<name>/migration.sql`, and apply
+with `npm run prisma:migrate:deploy`. Never edit an applied migration; add a new
+one, and hand-edit it (nullable → backfill → `SET NOT NULL`) when adding a
+required column to a table that may have rows.
 
 ## Toolchain constraints
 
@@ -62,41 +78,63 @@ synthetic configuration. Put Node test-runner options before file names.
   the `prisma-client` generator outputs to `src/generated/prisma`, and runtime
   connections use `@prisma/adapter-pg`.
 - Read configuration through the validated loaders in `src/config/env.ts`, not
-  `process.env`: `loadApiEnv()` (port, verify token, log level, Redis) for
-  `src/server.ts` and `loadWorkerEnv()` (log level, Redis only) for
-  `src/worker.ts`. `server.ts` constructs the logger, Redis connection, and
-  `IncomingMessageQueue`, then injects them into
-  `createApp({ logger, whatsappVerifyToken, incomingMessageQueue })`. Keep
-  `app.ts` free of `listen()`, environment loading, and Redis construction so
-  tests can use isolated dependencies.
+  `process.env`: `loadApiEnv()` (port, verify token, log level, Redis, database
+  URL) for `src/server.ts` and `loadWorkerEnv()` (log level, Redis only) for
+  `src/worker.ts`. `server.ts` is the composition root: it constructs the
+  logger, Prisma client, Redis connection, `IncomingMessageQueue`, and
+  `ConversationService(new PrismaUnitOfWork(prisma), logger)`, then injects them
+  into `createApp({ logger, whatsappVerifyToken, conversationService, incomingMessageQueue })`.
+  Keep `app.ts` free of `listen()`, environment loading, and Redis or Prisma
+  construction so tests can use isolated dependencies.
 
-## Current implementation (Phase 2: queue infrastructure)
+## Current implementation (Phase 3: persistence layer)
 
-- Implemented: GET verification, POST validation, enqueueing supported text
-  messages to BullMQ queue `incoming-messages`, and a separate worker that only
-  logs. Not implemented: PostgreSQL persistence, AI, caching, or WhatsApp sending.
-  Do not interpret the target flow below as implemented behavior.
+- Implemented: GET verification, POST validation, saving each supported text
+  message (with its user and conversation) in PostgreSQL, then enqueueing it to
+  BullMQ queue `incoming-messages`, and a separate worker that only logs. Not
+  implemented: AI, caching, WhatsApp sending, status-webhook processing, or
+  signature verification. Do not interpret the target flow below as implemented
+  behavior.
 - `WebhookController` owns GET verification and POST handling.
   `parseWebhookPayload(unknown)` validates the complete batch before logging or
-  enqueueing and returns only modeled fields. Only `field: "messages"` +
-  `type: "text"` + `from` messages become `IncomingMessageJob`s; others are
+  saving and returns only modeled fields. Only `field: "messages"` +
+  `type: "text"` + `from` messages are saved and queued; others are
   acknowledged with 200 and logged as `Webhook message not queued` with a reason.
-- The controller depends on `IncomingMessageQueuePort`, not BullMQ. The BullMQ
-  producer adds jobs one at a time with `queue.add`. Do not switch to `addBulk`
-  or other multi/pipeline paths: BullMQ 6.7.6's node-redis adapter has no
-  `NOSCRIPT` fallback there, so they fail permanently after a Redis restart
-  (covered by an integration test using `SCRIPT FLUSH`).
+  Message timestamps must be Unix seconds within the JavaScript `Date` range.
+- Save first, then queue. `ConversationService.recordInboundMessage()` runs one
+  transaction per message through the `IUnitOfWork`, serialized per sender with
+  a PostgreSQL transaction-level advisory lock: find or create the user, find
+  the user's latest conversation or create one, then save the `INBOUND` message.
+  A known `whatsappMessageId` returns the existing IDs (`duplicate: true`); the
+  same ID from another sender throws `WhatsappMessageIdConflictError` (500).
+  Services and controllers never import Prisma; repositories map Prisma rows to
+  domain types in `src/domain/`.
+- `Conversation` mirrors **WhatsApp** conversation metadata
+  (`whatsappConversationId` unique nullable, `category`, `originType`,
+  `expiresAt`, plus `startedAt` = the first stored message's WhatsApp
+  timestamp). Never create conversations from inactivity windows or business
+  rules. Inbound webhooks carry no conversation data, so the metadata stays NULL
+  until status webhooks are processed. AI memory or assistant threads must be a
+  separate concept, not overloaded onto `Conversation`.
+- The controller depends on `IConversationService` and
+  `IncomingMessageQueuePort`, not Prisma or BullMQ. The BullMQ producer adds jobs
+  one at a time with `queue.add` and `jobId` = the saved message's database ID.
+  Do not switch to `addBulk` or other multi/pipeline paths: BullMQ 6.7.6's
+  node-redis adapter has no `NOSCRIPT` fallback there, so they fail permanently
+  after a Redis restart (covered by an integration test using `SCRIPT FLUSH`).
 - Jobs use 3 attempts with exponential backoff (1000 ms). Producer connections
   disable the offline queue and use a 2 s command timeout; worker connections
   keep the offline queue and have no command timeout (blocking reads). On
   shutdown, close BullMQ objects before disconnecting Redis; the worker uses
   `worker.close(true)` when Redis is not ready so shutdown cannot hang.
 - `eventType` is `change.field`; `phoneNumber` is the message sender (`from`);
-  `messageId` is `message.id`. The transport `Message` interface is not a
-  database/domain model.
+  in logs and jobs, `whatsappMessageId` is Meta's `message.id` and `messageId`
+  is our database ID. The transport `Message` interface in
+  `src/shared/types/` is not the domain `Message`.
 - `x-correlation-id` is reused when it matches `^[a-zA-Z0-9._-]{1,128}$`,
   otherwise generated, echoed in the response, and carried inside each job so
-  worker logs share it. `userId`/`conversationId` do not exist until the DB phase.
+  worker logs share it. Jobs and logs also carry `userId`, `conversationId`,
+  and `messageId`; services log only after the transaction commits.
 - Never log raw request bodies, verification queries, headers, or message text;
   worker logs redact `messageText`. HTTP logs omit query strings and headers.
 - POSTs are not yet signature-authenticated. Default to local examples; the
@@ -105,7 +143,7 @@ synthetic configuration. Put Node test-runner options before file names.
   signature verification. Do not open a tunnel or change external accounts
   automatically when the user asks for setup instructions.
 - Add each new unit test file to the explicit file list in the `npm test` script;
-  Redis-dependent tests belong in `test:integration`.
+  Redis- or PostgreSQL-dependent tests belong in `test:integration`.
 - BullMQ does not start workers; they are started manually today. Automatic
   startup (containers, restart policies) and queue-based autoscaling are
   deliberately deferred until the proof of concept runs end to end (Chapter 3,
@@ -126,8 +164,9 @@ synthetic configuration. Put Node test-runner options before file names.
   `IAiProvider.generateResponse(userMessage, conversationHistory)` is the required
   AI contract; inject the Azure implementation through constructors.
   WhatsApp sending must remain an interface and placeholder, not a live sender.
-- Model `User` (`id`, `phoneNumber`, `createdAt`), `Conversation` (`id`, `userId`,
-  `createdAt`, `updatedAt`), and `Message` (`id`, `conversationId`, `direction`,
+- Model `User` (`id`, `phoneNumber` unique, `createdAt`, `updatedAt`),
+  `Conversation` (WhatsApp conversation metadata, as above), and `Message`
+  (`id`, `conversationId`, `whatsappMessageId` unique nullable, `direction`,
   `content`, `createdAt`). Message direction is `INBOUND` or `OUTBOUND`.
 
 ## Project-specific contracts
@@ -135,9 +174,9 @@ synthetic configuration. Put Node test-runner options before file names.
 - Stage 1's `GET /health` returns exactly `{"status":"healthy"}`.
   The target in `AGENTS.md` adds `"service":"whatsapp-ai-assistant"` in a later stage.
 - `GET /webhook` verifies `hub.mode=subscribe` and the environment-provided
-  token, then echoes the challenge as plain text. POST returns 200 after Redis
-  accepts any jobs; malformed requests return 400, and queue failures or
-  unexpected errors return a generic 500 so Meta retries.
+  token, then echoes the challenge as plain text. POST returns 200 after the
+  messages are saved and Redis accepts any jobs; malformed requests return 400,
+  and database, queue, or unexpected errors return a generic 500 so Meta retries.
 - Attach an `x-correlation-id` to every request. Use Pino and include
   `correlationId`, `userId`, and `conversationId` in relevant logs when available.
   Route errors through centralized error middleware; do not use `console.log`.

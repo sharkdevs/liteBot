@@ -18,6 +18,13 @@ The chapter number and phase number differ because the user named this work
 > and the validation rules described here still apply, with a few extra rules
 > for text messages.
 
+> **Updated by Phase 3.** [Chapter 4](04-persistence-layer.md) saves each
+> supported text message in PostgreSQL before it is queued, and if the database
+> cannot save it, the response is `500`. In logs, Meta's message ID is now
+> `whatsappMessageId`; `messageId` means the database ID instead (see
+> [Chapter 4, section 10](04-persistence-layer.md#a-renamed-field)). Timestamps
+> beyond the range of a JavaScript `Date` are now rejected with `400`.
+
 ## 1. Two HTTP methods, two different jobs
 
 A route is selected by both its path and its HTTP method. These requests use
@@ -207,7 +214,8 @@ event record without message metadata because we do not model status details yet
 The sanitized batch is logged once, rather than repeating it for every message.
 This keeps the amount of log data proportional to the request size.
 (Phase 2 replaced this batch log with just the entry count; see
-[Chapter 3](03-queue-infrastructure.md#7-correlation-ids-one-id-across-two-processes).)
+[Chapter 3](03-queue-infrastructure.md#7-correlation-ids-one-id-across-two-processes).
+Phase 3 renamed `messageId` in the event record to `whatsappMessageId`.)
 
 The HTTP request serializer also omits query strings and request headers.
 This matters because the GET verification token is in the URL query, and

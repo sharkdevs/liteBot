@@ -19,6 +19,14 @@ The worker only **logs** what it receives in this phase. It does not build a
 reply, call Azure OpenAI, write to PostgreSQL, or send a WhatsApp message.
 The goal is to understand the event-driven shape before real work is added.
 
+> **Updated by Phase 3.** This chapter describes the queue as Phase 2 built it.
+> [Chapter 4](04-persistence-layer.md) saves each message in PostgreSQL before
+> queuing it, and changes the job: `messageId` is now **our** database ID (and
+> the BullMQ job ID), Meta's ID moved to `whatsappMessageId`, and the job also
+> carries `userId` and `conversationId`. Every queue and worker log includes
+> those IDs, and a redelivered message is recognized instead of queued again.
+> The retry, shutdown, and worker behavior described here is unchanged.
+
 By the end of this chapter you should understand:
 
 1. Why a webhook should stay fast, and what a queue gives us.
@@ -191,6 +199,10 @@ A message is queued only when **all** of these are true:
 00:00 UTC). We do not convert it to milliseconds or an ISO date yet, so there
 is no chance of silently changing its meaning.
 
+(Since Phase 3, Meta's `id` maps to `whatsappMessageId`, and `messageId` holds
+our database ID; see
+[Chapter 4, section 10](04-persistence-layer.md#a-renamed-field).)
+
 ### New validation rules
 
 Phase 1's envelope validation still applies. Phase 2 adds three rules, checked
@@ -291,7 +303,8 @@ Worker  Incoming message processing completed correlationId=local-demo-1  jobId=
 
 The target requirements also mention `userId` and `conversationId`. Those do not
 exist until the database phase creates users and conversations, so they are not
-logged yet.
+logged yet. (Phase 3 added them; see
+[Chapter 4, section 10](04-persistence-layer.md#10-logs-new-lines-and-a-renamed-field).)
 
 **One change from Chapter 2's logs.** Phase 1 logged a sanitized copy of the
 whole batch in `WhatsApp webhook payload received`. That copy repeated the phone
@@ -353,7 +366,9 @@ Names and numbers in one place, so the producer and worker cannot disagree:
   `jobId`, `phoneNumber`, and `messageId`.
 
 BullMQ assigns job IDs (`1`, `2`, ...). We do not use Meta's message ID as the
-job ID yet; see section 12.
+job ID yet; see section 12. (Since Phase 3, the job ID is the saved message's
+database ID; see
+[Chapter 4, section 8](04-persistence-layer.md#8-duplicates-and-a-bug-found-by-hand).)
 
 #### A bug we found: why not `addBulk`?
 
@@ -678,7 +693,9 @@ same notification more than once, and a retried or interrupted job runs again.
 The system is "at least once": a message should be processed, possibly more than
 once. Later phases that send replies will need **idempotency** (for example,
 using Meta's message ID to recognize work already done) before duplicates
-matter. No deduplication exists yet.
+matter. No deduplication exists yet. (Phase 3 recognizes redelivered messages in
+PostgreSQL; see
+[Chapter 4, section 8](04-persistence-layer.md#8-duplicates-and-a-bug-found-by-hand).)
 
 **POSTs are still unauthenticated.** As in Chapter 2, anyone who can reach
 `/webhook` can submit a valid-looking event, and now that event becomes a job.
@@ -801,6 +818,9 @@ The pipeline exists, but the worker is a placeholder. Later phases will:
 - authenticate webhook deliveries and handle duplicates,
 - after the end-to-end flow works, revisit automatic worker startup and scaling
   (section 13).
+
+**Next:** [Chapter 4 - Persistence Layer (Phase 3)](04-persistence-layer.md),
+which adds the models, repositories, and persisted inbound messages.
 
 **Previous:** [Chapter 2 - Webhook Foundation (Phase 1)](02-webhook-foundation.md)
 

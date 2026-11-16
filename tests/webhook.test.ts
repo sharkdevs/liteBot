@@ -7,13 +7,22 @@ import { pino } from 'pino';
 
 import { createApp } from '../src/app.js';
 import type {
+  IConversationService,
+  InboundTextMessage,
+} from '../src/services/conversation.service.js';
+import type {
   IncomingMessageJob,
   IncomingMessageQueuePort,
 } from '../src/shared/types/incoming-message-job.js';
 
 const verifyToken = 'test-webhook-verification-token';
 
-async function startApp(t: TestContext, publisher?: IncomingMessageQueuePort) {
+interface AppOverrides {
+  queue?: IncomingMessageQueuePort;
+  conversationService?: IConversationService;
+}
+
+async function startApp(t: TestContext, overrides: AppOverrides = {}) {
   const logs: string[] = [];
   const destination = new Writable({
     write(chunk: Buffer, _encoding, callback) {
@@ -23,15 +32,32 @@ async function startApp(t: TestContext, publisher?: IncomingMessageQueuePort) {
   });
   const logger = pino({}, destination);
   const jobs: IncomingMessageJob[] = [];
-  const incomingMessageQueue = publisher ?? {
+  const recorded: InboundTextMessage[] = [];
+  const calls: string[] = [];
+  const incomingMessageQueue = overrides.queue ?? {
     enqueue(messages: IncomingMessageJob[]) {
+      calls.push('enqueue');
       jobs.push(...messages);
       return Promise.resolve();
+    },
+  };
+  // Deterministic stand-in IDs, so tests can tell which saved message a job refers to.
+  const conversationService = overrides.conversationService ?? {
+    recordInboundMessage(message: InboundTextMessage) {
+      calls.push(`record:${message.whatsappMessageId}`);
+      recorded.push(message);
+      return Promise.resolve({
+        userId: `user-${message.phoneNumber}`,
+        conversationId: `conversation-${message.phoneNumber}`,
+        messageId: `message-${message.whatsappMessageId}`,
+        duplicate: false,
+      });
     },
   };
   const server = createApp({
     logger,
     whatsappVerifyToken: verifyToken,
+    conversationService,
     incomingMessageQueue,
   }).listen(0, '127.0.0.1');
   t.after(async () => {
@@ -40,7 +66,14 @@ async function startApp(t: TestContext, publisher?: IncomingMessageQueuePort) {
   await once(server, 'listening');
   const address = server.address();
   assert.ok(address && typeof address !== 'string');
-  return { url: `http://127.0.0.1:${String(address.port)}/webhook`, logs, logger, jobs };
+  return {
+    url: `http://127.0.0.1:${String(address.port)}/webhook`,
+    logs,
+    logger,
+    jobs,
+    recorded,
+    calls,
+  };
 }
 
 await test('verification echoes the challenge as plain text without logging secrets', async (t) => {
@@ -130,11 +163,11 @@ await test('POST acknowledges a batch and logs only the validated payload metada
   assert.match(output, /WhatsApp webhook payload received/);
   assert.match(
     output,
-    /"eventType":"messages","phoneNumber":"15550000001","messageId":"wamid.first"/,
+    /"eventType":"messages","phoneNumber":"15550000001","whatsappMessageId":"wamid.first"/,
   );
   assert.match(
     output,
-    /"eventType":"messages","phoneNumber":"15550000002","messageId":"wamid.second"/,
+    /"eventType":"messages","phoneNumber":"15550000002","whatsappMessageId":"wamid.second"/,
   );
   assert.doesNotMatch(output, /PRIVATE_MESSAGE_TEXT|PRIVATE_CONTACT_PROFILE|PRIVATE_UNKNOWN_FIELD/);
 });
@@ -155,7 +188,7 @@ await test('POST accepts a message without a phone number and status-only change
 
   assert.equal(response.status, 200);
   await response.text();
-  assert.match(logs.join(''), /"eventType":"messages","messageId":"wamid.no-phone"/);
+  assert.match(logs.join(''), /"eventType":"messages","whatsappMessageId":"wamid.no-phone"/);
   assert.doesNotMatch(logs.join(''), /"phoneNumber"/);
 });
 
@@ -209,7 +242,7 @@ await test('POST rejects a malformed later entry before logging any accepted pay
   });
   assert.equal(response.status, 400);
   await response.text();
-  assert.doesNotMatch(logs.join(''), /WhatsApp webhook payload received|"messageId":/);
+  assert.doesNotMatch(logs.join(''), /WhatsApp webhook payload received|"whatsappMessageId":/);
 });
 
 for (const { name, body, contentType } of [
@@ -268,8 +301,8 @@ function textMessage(id = 'wamid.queued') {
   };
 }
 
-await test('POST enqueues text messages across entries with the request correlation ID', async (t) => {
-  const { url, jobs, logs } = await startApp(t);
+await test('POST saves each text message, then enqueues jobs carrying its database IDs', async (t) => {
+  const { url, jobs, recorded, calls, logs } = await startApp(t);
   const payload = payloadWith({ messages: [textMessage('wamid.first')] });
   payload.entry.push(...payloadWith({ messages: [textMessage('wamid.second')] }).entry);
   const response = await fetch(url, {
@@ -280,22 +313,53 @@ await test('POST enqueues text messages across entries with the request correlat
   assert.equal(response.status, 200);
   assert.equal(await response.text(), 'OK');
   assert.equal(response.headers.get('x-correlation-id'), 'webhook-queue-test');
+  assert.deepEqual(calls, ['record:wamid.first', 'record:wamid.second', 'enqueue']);
+  assert.deepEqual(
+    recorded,
+    ['wamid.first', 'wamid.second'].map((whatsappMessageId) => ({
+      correlationId: 'webhook-queue-test',
+      phoneNumber: '15550000001',
+      whatsappMessageId,
+      whatsappTimestamp: new Date('2026-11-16T16:00:00Z'),
+      content: 'PRIVATE_QUEUED_TEXT',
+    })),
+  );
   assert.deepEqual(
     jobs,
-    ['wamid.first', 'wamid.second'].map((messageId) => ({
+    ['wamid.first', 'wamid.second'].map((whatsappMessageId) => ({
+      correlationId: 'webhook-queue-test',
+      messageId: `message-${whatsappMessageId}`,
+      userId: 'user-15550000001',
+      conversationId: 'conversation-15550000001',
+      whatsappMessageId,
       phoneNumber: '15550000001',
-      messageId,
       messageText: 'PRIVATE_QUEUED_TEXT',
       timestamp: '1794844800',
-      correlationId: 'webhook-queue-test',
     })),
   );
   assert.doesNotMatch(logs.join(''), /PRIVATE_QUEUED_TEXT/);
 });
 
+await test('POST returns 500 and enqueues nothing when saving a message fails', async (t) => {
+  const { url, jobs, logs } = await startApp(t, {
+    conversationService: {
+      recordInboundMessage: () => Promise.reject(new Error('PRIVATE_DATABASE_FAILURE')),
+    },
+  });
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-correlation-id': 'database-failure-test' },
+    body: JSON.stringify(payloadWith({ messages: [textMessage()] })),
+  });
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), { error: 'Internal server error' });
+  assert.deepEqual(jobs, []);
+  assert.match(logs.join(''), /"correlationId":"database-failure-test"/);
+});
+
 await test('POST reports queue failure as 500 instead of acknowledging lost work', async (t) => {
   const { url, logs } = await startApp(t, {
-    enqueue: () => Promise.reject(new Error('PRIVATE_QUEUE_FAILURE')),
+    queue: { enqueue: () => Promise.reject(new Error('PRIVATE_QUEUE_FAILURE')) },
   });
   const response = await fetch(url, {
     method: 'POST',
@@ -307,8 +371,8 @@ await test('POST reports queue failure as 500 instead of acknowledging lost work
   assert.match(logs.join(''), /"correlationId":"queue-failure-test"/);
 });
 
-await test('POST rejects a malformed later text message before enqueueing any job', async (t) => {
-  const { url, jobs } = await startApp(t);
+await test('POST rejects a malformed later text message before saving or enqueueing', async (t) => {
+  const { url, jobs, recorded } = await startApp(t);
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -320,10 +384,12 @@ await test('POST rejects a malformed later text message before enqueueing any jo
   });
   assert.equal(response.status, 400);
   await response.text();
+  assert.deepEqual(recorded, []);
   assert.deepEqual(jobs, []);
 });
 
-for (const timestamp of [undefined, 'not-a-timestamp', '-1', 1794844800]) {
+// The last value is one second past the latest moment a JavaScript Date can represent.
+for (const timestamp of [undefined, 'not-a-timestamp', '-1', 1794844800, '8640000000001']) {
   await test(`POST rejects an invalid text-message timestamp: ${String(timestamp)}`, async (t) => {
     const { url, jobs } = await startApp(t);
     const response = await fetch(url, {
@@ -337,8 +403,8 @@ for (const timestamp of [undefined, 'not-a-timestamp', '-1', 1794844800]) {
   });
 }
 
-await test('POST acknowledges statuses, non-text and phone-less messages without queueing', async (t) => {
-  const { url, jobs, logs } = await startApp(t);
+await test('POST acknowledges statuses, non-text and phone-less messages without saving or queueing', async (t) => {
+  const { url, jobs, recorded, logs } = await startApp(t);
   const payload = payloadWith({
     messages: [
       { id: 'wamid.image', from: '15550000001', type: 'image' },
@@ -353,6 +419,7 @@ await test('POST acknowledges statuses, non-text and phone-less messages without
   });
   assert.equal(response.status, 200);
   await response.text();
+  assert.deepEqual(recorded, []);
   assert.deepEqual(jobs, []);
   assert.match(logs.join(''), /unsupported_message_type/);
   assert.match(logs.join(''), /missing_phone_number/);
