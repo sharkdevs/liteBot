@@ -8,6 +8,16 @@ There are no database writes, queue jobs, provider calls, or message processing.
 The chapter number and phase number differ because the user named this work
 "Phase 1" after the bootstrap had already been completed.
 
+> **Updated by Phase 2.** This chapter describes the webhook as Phase 1 built
+> it. [Chapter 3](03-queue-infrastructure.md) changes `POST /webhook` in four
+> ways: supported text messages are now added to a BullMQ queue before the
+> `200`; the sanitized-batch log is replaced by a smaller
+> `WhatsApp webhook payload received` line with `eventType: "webhook_received"`
+> and `entryCount`; every request gets an `x-correlation-id`; and if the queue
+> cannot accept the jobs, the response is `500`. The verification flow (GET)
+> and the validation rules described here still apply, with a few extra rules
+> for text messages.
+
 ## 1. Two HTTP methods, two different jobs
 
 A route is selected by both its path and its HTTP method. These requests use
@@ -196,6 +206,8 @@ event record without message metadata because we do not model status details yet
 
 The sanitized batch is logged once, rather than repeating it for every message.
 This keeps the amount of log data proportional to the request size.
+(Phase 2 replaced this batch log with just the entry count; see
+[Chapter 3](03-queue-infrastructure.md#7-correlation-ids-one-id-across-two-processes).)
 
 The HTTP request serializer also omits query strings and request headers.
 This matters because the GET verification token is in the URL query, and
@@ -291,6 +303,9 @@ deployment recipe. Do not connect real customer traffic until those safeguards
 are implemented.
 
 Persistence, queues, AI generation, and replies remain separate future phases.
+
+**Next:** [Chapter 3 - Queue Infrastructure (Phase 2)](03-queue-infrastructure.md),
+which adds the queue and worker.
 
 ## Official references
 

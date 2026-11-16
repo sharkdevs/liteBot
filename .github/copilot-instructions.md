@@ -27,11 +27,14 @@ the entire target system at once.
 ## Commands
 
 ```powershell
-npm run dev               # tsx watch src/server.ts
+npm run dev               # API: tsx watch src/server.ts
+npm run dev:worker        # Worker: tsx watch src/worker.ts (separate process)
 npm run build             # tsc -p tsconfig.build.json → dist/
 npm start                 # node dist/server.js
+npm run start:worker      # node dist/worker.js
 npm run typecheck         # tsc --noEmit (tsx does not type-check)
-npm test                  # Node's built-in runner, using tsx for TypeScript
+npm test                  # Node's built-in runner, using tsx for TypeScript (no Redis)
+npm run test:integration  # real BullMQ against local Redis (TEST_REDIS_PORT, default 6379)
 node --import tsx --test --test-name-pattern="occupied port" tests/bootstrap.test.ts
 node --import tsx --test --test-name-pattern="verification echoes" tests/webhook.test.ts
 npm run lint              # ESLint with typescript-eslint strictTypeChecked
@@ -40,8 +43,12 @@ npm run prisma:generate   # generates src/generated/prisma (gitignored)
 docker compose up -d --wait   # PostgreSQL 18 + Redis 8
 ```
 
-Bootstrap and webhook tests need no database or Redis. Production startup
-requires a non-empty `WHATSAPP_VERIFY_TOKEN`; tests inject synthetic configuration.
+`npm test` (bootstrap, webhook, config) needs no database or Redis; webhook tests
+inject an in-memory queue. `npm run test:integration` needs Redis
+(`docker compose up -d --wait redis`); each test uses a random BullMQ key prefix
+and deletes only its own keys. Never flush or stop the shared Compose Redis from
+tests. API startup requires a non-empty `WHATSAPP_VERIFY_TOKEN`; tests inject
+synthetic configuration. Put Node test-runner options before file names.
 
 ## Toolchain constraints
 
@@ -54,29 +61,51 @@ requires a non-empty `WHATSAPP_VERIFY_TOKEN`; tests inject synthetic configurati
 - Prisma 7 reads `DATABASE_URL` through `prisma.config.ts`, not the schema;
   the `prisma-client` generator outputs to `src/generated/prisma`, and runtime
   connections use `@prisma/adapter-pg`.
-- Read configuration through the validated `env` object in `src/config/env.ts`,
-  not `process.env`. `src/server.ts` constructs the logger and injects it and
-  the token into `createApp({ logger, whatsappVerifyToken })`. Keep `app.ts`
-  free of `listen()` and environment loading so tests can use isolated dependencies.
+- Read configuration through the validated loaders in `src/config/env.ts`, not
+  `process.env`: `loadApiEnv()` (port, verify token, log level, Redis) for
+  `src/server.ts` and `loadWorkerEnv()` (log level, Redis only) for
+  `src/worker.ts`. `server.ts` constructs the logger, Redis connection, and
+  `IncomingMessageQueue`, then injects them into
+  `createApp({ logger, whatsappVerifyToken, incomingMessageQueue })`. Keep
+  `app.ts` free of `listen()`, environment loading, and Redis construction so
+  tests can use isolated dependencies.
 
-## Current webhook phase
+## Current implementation (Phase 2: queue infrastructure)
 
-- Phase 1 is receiving and validation only. Do not interpret the target
-  persistence/queue/AI flow below as implemented behavior.
-- `WebhookController` owns GET verification and POST acknowledgement.
-  `parseWebhookPayload(unknown)` validates the complete batch before logging
-  and returns only modeled fields. Unknown fields are accepted but not logged.
-- `eventType` is `change.field`; `phoneNumber` is an optional message sender
-  (`from`); `messageId` is `message.id`. The transport `Message` interface is
-  not a database/domain model.
-- Never log raw request bodies, verification queries, or headers. HTTP logs
-  omit query strings and headers; webhook logs contain the validated projection.
+- Implemented: GET verification, POST validation, enqueueing supported text
+  messages to BullMQ queue `incoming-messages`, and a separate worker that only
+  logs. Not implemented: PostgreSQL persistence, AI, caching, or WhatsApp sending.
+  Do not interpret the target flow below as implemented behavior.
+- `WebhookController` owns GET verification and POST handling.
+  `parseWebhookPayload(unknown)` validates the complete batch before logging or
+  enqueueing and returns only modeled fields. Only `field: "messages"` +
+  `type: "text"` + `from` messages become `IncomingMessageJob`s; others are
+  acknowledged with 200 and logged as `Webhook message not queued` with a reason.
+- The controller depends on `IncomingMessageQueuePort`, not BullMQ. The BullMQ
+  producer adds jobs one at a time with `queue.add`. Do not switch to `addBulk`
+  or other multi/pipeline paths: BullMQ 6.7.6's node-redis adapter has no
+  `NOSCRIPT` fallback there, so they fail permanently after a Redis restart
+  (covered by an integration test using `SCRIPT FLUSH`).
+- Jobs use 3 attempts with exponential backoff (1000 ms). Producer connections
+  disable the offline queue and use a 2 s command timeout; worker connections
+  keep the offline queue and have no command timeout (blocking reads). On
+  shutdown, close BullMQ objects before disconnecting Redis; the worker uses
+  `worker.close(true)` when Redis is not ready so shutdown cannot hang.
+- `eventType` is `change.field`; `phoneNumber` is the message sender (`from`);
+  `messageId` is `message.id`. The transport `Message` interface is not a
+  database/domain model.
+- `x-correlation-id` is reused when it matches `^[a-zA-Z0-9._-]{1,128}$`,
+  otherwise generated, echoed in the response, and carried inside each job so
+  worker logs share it. `userId`/`conversationId` do not exist until the DB phase.
+- Never log raw request bodies, verification queries, headers, or message text;
+  worker logs redact `messageText`. HTTP logs omit query strings and headers.
 - POSTs are not yet signature-authenticated. Default to local examples; the
   README's temporary tunnel walkthrough is only for isolated, synthetic
   dashboard tests. Real customer traffic or production deployment requires HTTPS and Meta
   signature verification. Do not open a tunnel or change external accounts
   automatically when the user asks for setup instructions.
-- Add each new test file to the explicit file list in the `npm test` script.
+- Add each new unit test file to the explicit file list in the `npm test` script;
+  Redis-dependent tests belong in `test:integration`.
 
 ## Target architecture
 
@@ -102,9 +131,9 @@ requires a non-empty `WHATSAPP_VERIFY_TOKEN`; tests inject synthetic configurati
 - Stage 1's `GET /health` returns exactly `{"status":"healthy"}`.
   The target in `AGENTS.md` adds `"service":"whatsapp-ai-assistant"` in a later stage.
 - `GET /webhook` verifies `hub.mode=subscribe` and the environment-provided
-  token, then echoes the challenge as plain text. In Phase 1, POST only validates,
-  logs sanitized metadata, and returns 200; malformed requests return 400 and
-  unexpected errors return 500.
+  token, then echoes the challenge as plain text. POST returns 200 after Redis
+  accepts any jobs; malformed requests return 400, and queue failures or
+  unexpected errors return a generic 500 so Meta retries.
 - Attach an `x-correlation-id` to every request. Use Pino and include
   `correlationId`, `userId`, and `conversationId` in relevant logs when available.
   Route errors through centralized error middleware; do not use `console.log`.

@@ -4,10 +4,11 @@ A backend for a **WhatsApp AI assistant**, built as a learning project. It start
 small proof of concept, but is organised so it can grow into a distributed,
 multi-region system without a rewrite.
 
-> **Current status: Phase 1 — WhatsApp Webhook Foundation.** On top of the
-> bootstrap scaffold, `GET /webhook` verifies ownership and `POST /webhook`
-> validates and logs sanitized event metadata, then acknowledges it. There is
-> no persistence, queueing, message processing, or AI. See
+> **Current status: Phase 2 — Queue Infrastructure.** `GET /webhook` verifies
+> ownership. `POST /webhook` validates events and puts each supported text message
+> on a BullMQ queue in Redis, then acknowledges. A separate worker process takes
+> the jobs and logs them. There is no database persistence, AI, or reply sending
+> yet. See [Asynchronous Processing](#asynchronous-processing) and
 > [Implementation phases](#implementation-phases).
 
 New here? Read the [learning guide](docs/README.md). It explains each stage from
@@ -24,8 +25,9 @@ first principles, in the order it was built. The full target requirements live i
 
 ## Architecture vision
 
-This is the target architecture, not the current request path. Phase 1 stops
-after validation and logging; the worker, database, queue, and AI flow is future work.
+This is the target architecture, not the current request path. Phase 2 implements
+the Webhook API → BullMQ → Worker part, with a worker that only logs. PostgreSQL,
+Azure OpenAI, and WhatsApp sending are future work.
 
 ```text
  WhatsApp user
@@ -48,9 +50,9 @@ after validation and logging; the worker, database, queue, and AI flow is future
                                  Azure OpenAI   WhatsApp Cloud API
 ```
 
-Why eventually split the API from the worker? Meta expects a fast reply to every
-webhook call, while AI responses can take seconds. The API will record and enqueue;
-the slow work will happen elsewhere. The two can then be scaled independently.
+Why split the API from the worker? Meta expects a fast reply to every webhook
+call, while AI responses can take seconds. The API records the work and answers;
+the slow work happens elsewhere. The two can then be scaled independently.
 
 ## Tech stack
 
@@ -68,9 +70,10 @@ the slow work will happen elsewhere. The two can then be scaled independently.
 
 ## Local setup
 
-**Prerequisites:** Node.js 22.13+ on the 22.x release line, or Node.js 24+, and npm.
-The minimum matches ESLint's supported Node versions. Docker is optional for this
-phase: neither the server nor its tests connect to PostgreSQL or Redis.
+**Prerequisites:** Node.js 22.13+ on the 22.x release line, or Node.js 24+, npm,
+and Docker Desktop (or another Docker engine). The Node minimum matches ESLint's
+supported Node versions. Since Phase 2, Redis must be running for the webhook to
+accept text messages; PostgreSQL is not used yet.
 
 For step 3 below, follow [Generate your verification token](#generate-your-verification-token)
 for the exact command and `.env` instructions.
@@ -83,10 +86,16 @@ npm ci
 Copy-Item .env.example .env        # macOS/Linux: cp .env.example .env
 
 # 3. Generate a private token and save it as WHATSAPP_VERIFY_TOKEN in .env.
-#    An existing .env from the bootstrap stage needs this new setting too.
+#    An existing .env from the bootstrap stage needs this setting too.
 
-# 4. Run the API with auto-reload
+# 4. Start Redis (the queue's storage) in the background
+docker compose up -d --wait redis
+
+# 5. Run the API with auto-reload
 npm run dev
+
+# 6. In a second terminal, run the worker with auto-reload
+npm run dev:worker
 ```
 
 Check it works:
@@ -96,16 +105,20 @@ curl http://localhost:3000/health
 # {"status":"healthy"}
 ```
 
-Optional bootstrap tooling remains available:
+The API logs `HTTP server listening` and `Redis connection ready`; the worker logs
+`Redis connection ready` and `Incoming message worker ready`.
+
+PostgreSQL and Prisma tooling from the bootstrap stage remain available but unused:
 
 ```powershell
-docker compose up -d --wait
+docker compose up -d --wait        # PostgreSQL and Redis
 npm run prisma:generate
 ```
 
-Stop these services with `docker compose down` (add `-v` to delete their data).
-Their default ports are published only on `127.0.0.1`; the example database
-credentials and unauthenticated Redis are for local development, not deployment.
+Stop these services with `docker compose down` (add `-v` to delete their data,
+including any queued jobs). Their default ports are published only on
+`127.0.0.1`; the example database credentials and unauthenticated Redis are for
+local development, not deployment.
 
 See the [dependency notes](docs/01-bootstrap.md#version-choices) for the agreed
 version exceptions, BullMQ's transitive deprecation warning, and a deferred
@@ -113,17 +126,20 @@ development-only lint dependency advisory.
 
 ## Commands
 
-| Command                   | What it does                                                 |
-| ------------------------- | ------------------------------------------------------------ |
-| `npm run dev`             | Run `src/server.ts` with tsx, restarting on change           |
-| `npm run build`           | Compile `src/` to JavaScript in `dist/`                      |
-| `npm start`               | Run the compiled server from `dist/`                         |
-| `npm run typecheck`       | Type-check without writing files                             |
-| `npm test`                | Run bootstrap and webhook HTTP tests with Node's test runner |
-| `npm run lint`            | Run ESLint                                                   |
-| `npm run format`          | Format all files with Prettier                               |
-| `npm run format:check`    | Report formatting problems without changing files            |
-| `npm run prisma:generate` | Generate the Prisma client into `src/generated/`             |
+| Command                    | What it does                                                    |
+| -------------------------- | --------------------------------------------------------------- |
+| `npm run dev`              | Run the API (`src/server.ts`) with tsx, restarting on change    |
+| `npm run dev:worker`       | Run the worker (`src/worker.ts`) with tsx, restarting on change |
+| `npm run build`            | Compile `src/` to JavaScript in `dist/`                         |
+| `npm start`                | Run the compiled API from `dist/server.js`                      |
+| `npm run start:worker`     | Run the compiled worker from `dist/worker.js`                   |
+| `npm run typecheck`        | Type-check without writing files                                |
+| `npm test`                 | Startup, configuration, and webhook HTTP tests (no Redis)       |
+| `npm run test:integration` | Real BullMQ queue and worker tests (needs local Redis)          |
+| `npm run lint`             | Run ESLint                                                      |
+| `npm run format`           | Format all files with Prettier                                  |
+| `npm run format:check`     | Report formatting problems without changing files               |
+| `npm run prisma:generate`  | Generate the Prisma client into `src/generated/`                |
 
 To run only the startup regression test:
 
@@ -138,7 +154,11 @@ node --import tsx --test tests/webhook.test.ts
 node --import tsx --test --test-name-pattern="verification echoes" tests/webhook.test.ts
 ```
 
-Tests use synthetic tokens and require neither PostgreSQL nor Redis.
+`npm test` uses synthetic tokens and an in-memory queue, so it needs neither
+PostgreSQL nor Redis. `npm run test:integration` connects to Redis on
+`127.0.0.1:6379` (override with `TEST_REDIS_PORT`); start it with
+`docker compose up -d --wait redis`. Each integration test uses its own random
+key prefix and deletes only its own keys.
 
 ## Webhook Verification
 
@@ -222,9 +242,12 @@ Remove-Variable verifyToken, encodedToken
 ### GET versus POST
 
 `GET /webhook` is the subscription handshake. `POST /webhook` carries JSON event
-notifications after subscription. POST currently validates the envelope, logs
-an allow-listed payload plus `eventType`, `phoneNumber`, and `messageId` when
-available, and returns `200 OK`. It does not process or save messages.
+notifications after subscription. Since Phase 2, POST validates the whole
+envelope, then puts each supported **text** message on the `incoming-messages`
+queue in Redis and returns `200 OK` once Redis has accepted the jobs. Other
+events (delivery statuses, images, and so on) are logged as not queued and still
+acknowledged with `200`. A separate worker process consumes the queue; see
+[Asynchronous Processing](#asynchronous-processing).
 
 ```powershell
 $payload = @'
@@ -235,7 +258,13 @@ $payload = @'
     "changes": [{
       "field": "messages",
       "value": {
-        "messages": [{ "id": "wamid.local-example", "from": "15550000001" }]
+        "messages": [{
+          "id": "wamid.local-example",
+          "from": "15550000001",
+          "timestamp": "1767225600",
+          "type": "text",
+          "text": { "body": "Hello from a local test" }
+        }]
       }
     }]
   }]
@@ -245,19 +274,23 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:3000/webhook' -ContentType
 # OK
 ```
 
-Malformed envelopes, invalid JSON, unsupported body formats, and oversized
-bodies return `400`; unexpected failures return a generic `500`. `/health`
-still returns `{"status":"healthy"}`.
+Malformed envelopes, invalid JSON, unsupported body formats, oversized bodies,
+and text messages without a body or numeric timestamp return `400`. If Redis
+cannot accept the jobs, or another unexpected failure happens, the response is a
+generic `500` so Meta retries later. `/health` still returns
+`{"status":"healthy"}` and does not check Redis.
 
 **Local foundation, not a public deployment yet:** a successful GET handshake
 does not authenticate subsequent POST requests. Signature checking
-(`X-Hub-Signature-256`) is not implemented in this phase. Before accepting real
-traffic, add signature verification and HTTPS. Logs deliberately omit message
-text, contact profiles, unknown payload fields, query strings, and request headers;
-phone numbers are still personal data and require appropriate log controls.
+(`X-Hub-Signature-256`) is not implemented yet, so anyone who can reach
+`/webhook` can create queue jobs. Before accepting real traffic, add signature
+verification and HTTPS. Logs deliberately omit message text, contact profiles,
+unknown payload fields, query strings, and request headers; phone numbers are
+still personal data and require appropriate log controls. Queued jobs, including
+message text, are stored in Redis.
 
-Read [Chapter 2](docs/02-webhook-foundation.md) for the validation contract,
-request flow, and explanation of every new component.
+Read [Chapter 2](docs/02-webhook-foundation.md) for the validation contract and
+[Chapter 3](docs/03-queue-infrastructure.md) for how messages become jobs.
 
 ### Does the webhook have to be hosted?
 
@@ -307,13 +340,21 @@ Follow [Generate your verification token](#generate-your-verification-token)
 to create and save the value in `.env`. If you already did that, reuse the
 existing value; do not generate a different one for the dashboard.
 The following examples use the default `PORT=3000`.
-Start or restart the server so it reads your saved settings:
+Start Redis, then start or restart the API so it reads your saved settings:
 
 ```powershell
+docker compose up -d --wait redis
 npm run dev
 ```
 
-Leave that terminal running. In another terminal, confirm local connectivity:
+Leave that terminal running. In a second terminal, start the worker so queued
+messages are processed:
+
+```powershell
+npm run dev:worker
+```
+
+In a third terminal, confirm local connectivity:
 
 ```powershell
 Invoke-RestMethod 'http://localhost:3000/health'
@@ -374,9 +415,12 @@ Then use the **Test** link for that field and send its sample notification.
 Meta documents this sample test as available in both Development and Live modes.
 
 Watch the terminal running `npm run dev`. A successful POST produces
-`WhatsApp webhook payload received` and `WhatsApp webhook event received`,
-with the modeled metadata when present, and returns `200 OK`.
-**No WhatsApp reply is expected:** this phase only logs and acknowledges.
+`WhatsApp webhook payload received` and `WhatsApp webhook event received`.
+Meta's `messages` sample is a text message, so the API also logs
+`Incoming message queued` with a `jobId`, then returns `200 OK`. The worker
+terminal then logs `Incoming message processing started` and
+`Incoming message processing completed` with the same `correlationId`.
+**No WhatsApp reply is expected:** the worker only logs in this phase.
 
 The dashboard sample proves that the callback path works. It does not prove
 that a real phone number/account is correctly connected or subscribed. Real
@@ -386,62 +430,126 @@ on this temporary receiver.
 
 #### 6. End the test
 
-Stop ngrok with Ctrl+C when finished; stop the local server if you no longer
-need it. Disconnect the temporary test subscription/callback if you are done
-with it. If the public URL changes on a later session, update the Callback URL
-and run **Verify and save** again. Meta cannot deliver while your server or
+Stop ngrok with Ctrl+C when finished; stop the local API and worker if you no
+longer need them. Disconnect the temporary test subscription/callback if you are
+done with it. If the public URL changes on a later session, update the Callback
+URL and run **Verify and save** again. Meta cannot deliver while your server or
 tunnel is stopped.
 
 ### Dashboard troubleshooting
 
-| Symptom                                              | Check                                                                                                  |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Verification times out or the tunnel returns 502     | Both processes are running; ngrok targets the same port as `PORT`; the public hostname is current      |
-| Verification returns 403                             | The Verify token exactly matches `.env`; restart after changing it; do not use a WhatsApp access token |
-| Callback returns 404 or health JSON                  | The Callback URL must end in `/webhook`, not `/health` or just the host                                |
-| Opening `/webhook` directly in a browser returns 403 | Expected without Meta's verification query parameters; this alone does not mean the endpoint is broken |
-| Meta receives a login page or other HTML             | It must reach the actual endpoint without interactive browser authentication or an intervening page    |
-| Verification succeeds but there are no POST logs     | Subscribe to **messages**, use that field's **Test**, and check the same app's callback configuration  |
-| A sample POST returns 400                            | Select the WhatsApp **messages** test, not another webhook object; the receiver validates the envelope |
-| POST succeeds but there is no WhatsApp reply         | Expected for Phase 1; sending and business logic are not implemented                                   |
+| Symptom                                               | Check                                                                                                  |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Verification times out or the tunnel returns 502      | Both processes are running; ngrok targets the same port as `PORT`; the public hostname is current      |
+| Verification returns 403                              | The Verify token exactly matches `.env`; restart after changing it; do not use a WhatsApp access token |
+| Callback returns 404 or health JSON                   | The Callback URL must end in `/webhook`, not `/health` or just the host                                |
+| Opening `/webhook` directly in a browser returns 403  | Expected without Meta's verification query parameters; this alone does not mean the endpoint is broken |
+| Meta receives a login page or other HTML              | It must reach the actual endpoint without interactive browser authentication or an intervening page    |
+| Verification succeeds but there are no POST logs      | Subscribe to **messages**, use that field's **Test**, and check the same app's callback configuration  |
+| A sample POST returns 400                             | Select the WhatsApp **messages** test, not another webhook object; the receiver validates the envelope |
+| A sample POST returns 500                             | Redis is not reachable: run `docker compose up -d --wait redis`; the API reconnects without a restart  |
+| The API logs `Incoming message queued`, worker silent | Start the worker with `npm run dev:worker`; queued jobs wait in Redis until a worker runs              |
+| POST succeeds but there is no WhatsApp reply          | Expected for Phase 2; AI replies and sending are not implemented                                       |
 
 Sources: [Meta callback configuration](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/create-webhook-endpoint#configure-webhooks),
 [Meta dashboard sample tests](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/set-up-whatsapp-echo-bot),
 and [ngrok local webhook testing](https://ngrok.com/docs/share-localhost/webhooks).
 
+## Asynchronous Processing
+
+Phase 2 splits the work into two processes connected by a queue:
+
+```text
+WhatsApp
+    |
+Webhook        (API process: validate, enqueue, return 200)
+    |
+BullMQ         (the incoming-messages queue, stored in Redis)
+    |
+Worker         (separate process: takes jobs and processes them)
+```
+
+### Why the webhook should stay fast
+
+Meta sends every notification as an HTTP POST and waits for the answer. If the
+answer is not `200`, or delivery fails, Meta
+[retries for up to 7 days](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/overview#webhook-delivery-failure),
+and retries can create duplicates. Future processing (database reads, Azure
+OpenAI, sending the reply) can take seconds. Doing it before answering would
+risk slow or failed deliveries, repeated messages, and a busy web server that
+cannot accept new notifications. So the webhook only checks the request, records
+the work as a **job**, and answers.
+
+### Why a queue helps
+
+| Benefit         | How the queue provides it                                                                                          |
+| --------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **Reliability** | Once Redis accepts a job, it waits there even if no worker is running or a worker crashes mid-job.                 |
+| **Retries**     | If processing throws, BullMQ tries again: 3 attempts in total, with exponential backoff (~1 s, then ~2 s).         |
+| **Scalability** | The API and the worker scale separately: add workers when processing is the bottleneck, API instances for traffic. |
+| **Decoupling**  | The webhook only knows the job contract. Adding AI later changes the worker, not the webhook.                      |
+
+### Running workers
+
+The worker is a separate program with its own entrypoint, `src/worker.ts`:
+
+```powershell
+npm run dev:worker        # development, restarts on change
+npm run build
+npm run start:worker      # compiled, from dist/worker.js
+```
+
+It needs only Redis settings (`REDIS_HOST`, `REDIS_PORT`) and `LOG_LEVEL`, not
+the HTTP port or verification token. It starts even if no messages arrive or
+Redis is still starting, and it shuts down on Ctrl+C or `SIGTERM`. Each job
+carries the request's `x-correlation-id`, so API and worker logs for one message
+share the same `correlationId`. You can run several workers at once; BullMQ gives
+each job to one of them.
+
+In this phase the worker only **logs** each job (with the message text
+redacted). It does not save data, call Azure OpenAI, or send WhatsApp messages.
+Jobs live in Redis, which is not yet the system of record, and processing is
+"at least once": a message may occasionally be processed twice.
+[Chapter 3](docs/03-queue-infrastructure.md) walks through the design, hands-on
+experiments, retries, tests, and these limits in detail.
+
 ## Environment variables
 
 Defined in [`.env.example`](.env.example). Copy it to `.env`; never commit `.env`.
 
-| Variable                   | Used from | Purpose                                                   |
-| -------------------------- | --------- | --------------------------------------------------------- |
-| `PORT`                     | Stage 1   | HTTP port (default `3000`)                                |
-| `LOG_LEVEL`                | Stage 1   | Pino log level (default `info`)                           |
-| `DATABASE_URL`             | Stage 1   | PostgreSQL connection string, read by Prisma              |
-| `REDIS_HOST`, `REDIS_PORT` | Later     | Redis location for BullMQ and caching                     |
-| `AZURE_OPENAI_*`           | Later     | Endpoint, API key, and deployment name for AI replies     |
-| `WHATSAPP_VERIFY_TOKEN`    | Phase 1   | Required non-empty token you choose for the GET handshake |
-| `WHATSAPP_ACCESS_TOKEN`    | Later     | Token for calling the WhatsApp Cloud API                  |
-| `WHATSAPP_PHONE_NUMBER_ID` | Later     | The WhatsApp business number that sends replies           |
+| Variable                   | Used from | Purpose                                                                                        |
+| -------------------------- | --------- | ---------------------------------------------------------------------------------------------- |
+| `PORT`                     | Stage 1   | API HTTP port (default `3000`)                                                                 |
+| `LOG_LEVEL`                | Stage 1   | Pino log level for the API and worker (default `info`)                                         |
+| `DATABASE_URL`             | Stage 1   | PostgreSQL connection string, read by Prisma                                                   |
+| `REDIS_HOST`, `REDIS_PORT` | Phase 2   | Redis location for the BullMQ queue, used by the API and worker (defaults `localhost`, `6379`) |
+| `AZURE_OPENAI_*`           | Later     | Endpoint, API key, and deployment name for AI replies                                          |
+| `WHATSAPP_VERIFY_TOKEN`    | Phase 1   | Required non-empty token you choose for the GET handshake (API only)                           |
+| `WHATSAPP_ACCESS_TOKEN`    | Later     | Token for calling the WhatsApp Cloud API                                                       |
+| `WHATSAPP_PHONE_NUMBER_ID` | Later     | The WhatsApp business number that sends replies                                                |
+
+`TEST_REDIS_PORT` (default `6379`) is read only by `npm run test:integration`.
 
 ## Project layout
 
 ```text
 src/
-├── server.ts          Starts the HTTP server; handles shutdown signals
+├── server.ts          API entrypoint: Redis, queue, HTTP server, shutdown
+├── worker.ts          Worker entrypoint: Redis, BullMQ worker, shutdown
 ├── app.ts             Builds the Express app (middleware + routes)
-├── config/            Environment parsing and the shared logger
+├── config/            Environment parsing, the shared logger, Redis connections
 ├── routes/            URL → handler wiring (/health and /webhook)
 ├── controllers/       Verification and inbound webhook handlers
 ├── services/          Application logic                (later stage)
 ├── repositories/      Database access via Prisma       (later stage)
 ├── providers/         Azure OpenAI and WhatsApp clients (later stage)
-├── queues/            BullMQ queue definitions         (later stage)
-├── workers/           Background job processors        (later stage)
-├── middleware/        Centralized 400/500 responses (correlation IDs later)
-├── shared/            Cross-cutting types, constants, utilities
+├── queues/            The incoming-messages queue (producer side)
+├── workers/           The incoming-message job processor (consumer side)
+├── middleware/        Correlation IDs and centralized 400/500 responses
+├── shared/            Cross-cutting types (incl. the job contract), constants, utilities
 └── generated/         Prisma client output (generated; not committed)
 prisma/                Database schema and, later, migrations
+tests/                 Unit/HTTP tests and Redis integration tests
 docs/                  Learning guide, one chapter per stage
 ```
 
@@ -451,10 +559,11 @@ docs/                  Learning guide, one chapter per stage
 | ---------------------------- | -------------------------------------------------------------------------------------- | ------- |
 | Bootstrap (previous Stage 1) | Tooling, Express, logging, Prisma, Docker Compose                                      | ✅ Done |
 | 1                            | Webhook ownership verification, payload validation, metadata logging, 400/500 handling | ✅ Done |
-| Future                       | POST signature verification and correlation IDs                                        | Planned |
-| Future                       | Data model, migrations, and repositories                                               | Planned |
-| Future                       | Durable ingestion, BullMQ, and separate workers                                        | Planned |
-| Future                       | AI provider, conversation cache, outbound placeholder, and end-to-end flow             | Planned |
+| 2                            | BullMQ queue in Redis, separate logging worker, retries, correlation IDs               | ✅ Done |
+| Future                       | POST signature verification                                                            | Planned |
+| Future                       | Data model, migrations, repositories, and persisted inbound messages                   | Planned |
+| Future                       | AI provider, conversation cache, outbound placeholder, and end-to-end worker flow      | Planned |
+| Future                       | Duplicate handling (idempotency) and production durability                             | Planned |
 
 The current phase follows the user's phase numbering; the original bootstrap
 remains Chapter 1 in the learning guide. Future implementation order will be
