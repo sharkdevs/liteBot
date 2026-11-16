@@ -11,6 +11,26 @@ import { createLogger } from '../src/config/logger.js';
 
 const execFileAsync = promisify(execFile);
 
+await test('startup rejects an unconfigured webhook verification token', async () => {
+  await assert.rejects(
+    execFileAsync(
+      process.execPath,
+      ['--import', 'tsx', fileURLToPath(new URL('../src/server.ts', import.meta.url))],
+      {
+        env: { ...process.env, PORT: '3000', LOG_LEVEL: 'info', WHATSAPP_VERIFY_TOKEN: '' },
+        timeout: 10_000,
+      },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && 'code' in error && 'stderr' in error);
+      assert.equal(error.code, 1);
+      assert.ok(typeof error.stderr === 'string');
+      assert.match(error.stderr, /WHATSAPP_VERIFY_TOKEN must be configured/);
+      return true;
+    },
+  );
+});
+
 await test('health returns the Stage 1 response without database or Redis connections', async (t) => {
   const server = createApp({
     logger: createLogger('silent'),

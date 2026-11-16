@@ -3,6 +3,7 @@ import type { Logger } from 'pino';
 import { pinoHttp } from 'pino-http';
 
 import { WebhookController } from './controllers/webhook.controller.js';
+import { createErrorMiddleware } from './middleware/error.middleware.js';
 import { healthRouter } from './routes/health.route.js';
 import { createWebhookRouter } from './routes/webhook.route.js';
 
@@ -29,6 +30,7 @@ export function createApp({ logger, whatsappVerifyToken }: AppDependencies): Exp
 
   app.use(healthRouter);
   app.use('/webhook', createWebhookRouter(new WebhookController(whatsappVerifyToken, logger)));
+  app.use(createErrorMiddleware(logger));
 
   // TODO(later stages): correlation-id middleware and authenticated webhook delivery.
   // TODO(later stages): enable `cors` with an explicit origin allow-list once a browser client exists.
