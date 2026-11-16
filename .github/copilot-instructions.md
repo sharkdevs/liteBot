@@ -33,13 +33,15 @@ npm start                 # node dist/server.js
 npm run typecheck         # tsc --noEmit (tsx does not type-check)
 npm test                  # Node's built-in runner, using tsx for TypeScript
 node --import tsx --test --test-name-pattern="occupied port" tests/bootstrap.test.ts
+node --import tsx --test --test-name-pattern="verification echoes" tests/webhook.test.ts
 npm run lint              # ESLint with typescript-eslint strictTypeChecked
 npm run format:check      # Prettier
 npm run prisma:generate   # generates src/generated/prisma (gitignored)
 docker compose up -d --wait   # PostgreSQL 18 + Redis 8
 ```
 
-The bootstrap tests in `tests/bootstrap.test.ts` need no database or Redis.
+Bootstrap and webhook tests need no database or Redis. Production startup
+requires a non-empty `WHATSAPP_VERIFY_TOKEN`; tests inject synthetic configuration.
 
 ## Toolchain constraints
 
@@ -53,8 +55,25 @@ The bootstrap tests in `tests/bootstrap.test.ts` need no database or Redis.
   the `prisma-client` generator outputs to `src/generated/prisma`, and runtime
   connections use `@prisma/adapter-pg`.
 - Read configuration through the validated `env` object in `src/config/env.ts`,
-  not `process.env`. Keep `createApp()` in `src/app.ts` free of `listen()` so
-  the app can be tested in memory; `src/server.ts` owns the process lifecycle.
+  not `process.env`. `src/server.ts` constructs the logger and injects it and
+  the token into `createApp({ logger, whatsappVerifyToken })`. Keep `app.ts`
+  free of `listen()` and environment loading so tests can use isolated dependencies.
+
+## Current webhook phase
+
+- Phase 1 is receiving and validation only. Do not interpret the target
+  persistence/queue/AI flow below as implemented behavior.
+- `WebhookController` owns GET verification and POST acknowledgement.
+  `parseWebhookPayload(unknown)` validates the complete batch before logging
+  and returns only modeled fields. Unknown fields are accepted but not logged.
+- `eventType` is `change.field`; `phoneNumber` is an optional message sender
+  (`from`); `messageId` is `message.id`. The transport `Message` interface is
+  not a database/domain model.
+- Never log raw request bodies, verification queries, or headers. HTTP logs
+  omit query strings and headers; webhook logs contain the validated projection.
+- POSTs are not yet signature-authenticated. Keep this foundation local until
+  HTTPS and Meta signature verification are implemented.
+- Add each new test file to the explicit file list in the `npm test` script.
 
 ## Target architecture
 
@@ -79,8 +98,10 @@ The bootstrap tests in `tests/bootstrap.test.ts` need no database or Redis.
 
 - Stage 1's `GET /health` returns exactly `{"status":"healthy"}`.
   The target in `AGENTS.md` adds `"service":"whatsapp-ai-assistant"` in a later stage.
-- `GET /webhook` must support Meta verification using an environment-provided
-  verification token; `POST /webhook` follows the asynchronous flow above.
+- `GET /webhook` verifies `hub.mode=subscribe` and the environment-provided
+  token, then echoes the challenge as plain text. In Phase 1, POST only validates,
+  logs sanitized metadata, and returns 200; malformed requests return 400 and
+  unexpected errors return 500.
 - Attach an `x-correlation-id` to every request. Use Pino and include
   `correlationId`, `userId`, and `conversationId` in relevant logs when available.
   Route errors through centralized error middleware; do not use `console.log`.
