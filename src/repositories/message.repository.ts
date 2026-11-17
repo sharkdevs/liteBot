@@ -66,7 +66,12 @@ export class MessageRepository implements IMessageRepository {
     if (replyToMessageId === undefined) {
       return this.db.message.create({ data });
     }
-    return this.db.message.upsert({ where: { replyToMessageId }, create: data, update: {} });
+    return this.db.message.upsert({
+      where: { replyToMessageId },
+      create: data,
+      // A nonempty conflict update keeps Prisma's upsert atomic without replacing the reply.
+      update: { replyToMessageId },
+    });
   }
 
   findReplyToMessage(replyToMessageId: string): Promise<Message | null> {

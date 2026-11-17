@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { Writable } from 'node:stream';
 import { test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { pino } from 'pino';
 
 import { WhatsappMessageIdConflictError } from '../src/domain/message/message-id-conflict.error.js';
@@ -150,6 +151,63 @@ await test('persistence layer', async (t) => {
       assert.doesNotMatch(logs, new RegExp(phoneNumber));
     },
   );
+
+  await t.test('concurrent reply saves return one immutable response', async () => {
+    const service = new ConversationService(unitOfWork, pino({ level: 'silent' }));
+    const recorded = await service.recordInboundMessage(
+      inbound(syntheticPhoneNumber(), 'wamid.concurrent-reply'),
+    );
+    const { outcomes } = await prisma.$transaction(async (tx) => {
+      // Allow initial reads, but hold inserts until all four transactions reach them.
+      await tx.$executeRaw`LOCK TABLE messages IN SHARE MODE`;
+      const outcomes = Promise.allSettled(
+        Array.from({ length: 4 }, (_, index) =>
+          service.saveOutboundMessage(
+            recorded.conversationId,
+            `Concurrent reply ${String(index)}`,
+            recorded.messageId,
+          ),
+        ),
+      );
+      const deadline = Date.now() + 2000;
+      let waiting: number;
+      do {
+        const [locks] = await tx.$queryRaw<{ waiting: number }[]>`
+          SELECT count(*)::int AS waiting FROM pg_locks
+          WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database())
+            AND relation = 'messages'::regclass
+            AND mode = 'RowExclusiveLock' AND NOT granted
+        `;
+        waiting = locks?.waiting ?? 0;
+        if (waiting < 4) await delay(10);
+      } while (waiting < 4 && Date.now() < deadline);
+      assert.equal(waiting, 4, 'All reply saves must overlap before the lock is released');
+      return { outcomes };
+    });
+    const replies = (await outcomes).map((outcome) => {
+      assert.ok(outcome.status === 'fulfilled', 'Concurrent reply saves must not reject');
+      return outcome.value;
+    });
+    const [reply] = replies;
+    assert.ok(reply);
+    for (const saved of replies) assert.deepEqual(saved, reply);
+    assert.equal(
+      await prisma.message.count({ where: { replyToMessageId: recorded.messageId } }),
+      1,
+    );
+
+    await new MessageRepository(prisma).markSent(reply.id, 'wamid.concurrent-receipt');
+    const replay = await service.saveOutboundMessage(
+      recorded.conversationId,
+      'Do not replace the first response',
+      recorded.messageId,
+    );
+    assert.deepEqual(replay, {
+      ...reply,
+      status: 'SENT',
+      whatsappMessageId: 'wamid.concurrent-receipt',
+    });
+  });
 
   await t.test(
     'outbound receipts persist status and a saved reply is reused per inbound message',

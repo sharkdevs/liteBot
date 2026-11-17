@@ -107,7 +107,14 @@ caused a reply. This handles a particularly important failure:
    without another model call.
 
 The repository upsert also prevents concurrent attempts from saving two replies
-for one inbound message. A saved `SENT` or `FAILED` reply is not automatically
+for one inbound message. Its conflict update writes back the same
+`replyToMessageId`, leaving the first reply's content, status, and receipt intact.
+This nonempty update uses PostgreSQL's atomic conflict handling: an empty Prisma
+update can instead perform separate lookup/insert operations that race and fail
+with `P2002`. The integration test holds inserts until four concurrent saves
+overlap, then verifies that every caller receives the same reply.
+
+A saved `SENT` or `FAILED` reply is not automatically
 requeued by an incoming-job replay. Failed deliveries must be investigated
 separately instead of being silently resent.
 
