@@ -15,6 +15,7 @@ const PRISMA_CLI = fileURLToPath(
 
 export interface TestDatabase {
   readonly prisma: PrismaClient;
+  readonly databaseUrl: string;
   drop(): Promise<void>;
 }
 
@@ -52,6 +53,7 @@ export async function createTestDatabase(): Promise<TestDatabase> {
   const prisma = createPrismaClient(url.href, silent);
   return {
     prisma,
+    databaseUrl: url.href,
     async drop() {
       try {
         await prisma.$disconnect();

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { loadApiEnv, loadWorkerEnv } from '../src/config/env.js';
+import { loadApiEnv, loadReconciliationEnv, loadWorkerEnv } from '../src/config/env.js';
 
 for (const redis of [
   { REDIS_HOST: '' },
@@ -12,16 +12,23 @@ for (const redis of [
 ]) {
   await test(`Redis configuration rejects ${JSON.stringify(redis)}`, () => {
     assert.throws(
-      () => loadApiEnv({ WHATSAPP_VERIFY_TOKEN: 'synthetic-token', ...redis }),
+      () =>
+        loadApiEnv({
+          WHATSAPP_VERIFY_TOKEN: 'synthetic-token',
+          WHATSAPP_APP_SECRET: 'synthetic-app-secret',
+          ...redis,
+        }),
       /REDIS_HOST|REDIS_PORT/,
     );
     assert.throws(() => loadWorkerEnv(redis), /REDIS_HOST|REDIS_PORT/);
+    assert.throws(() => loadReconciliationEnv(redis), /REDIS_HOST|REDIS_PORT/);
   });
 }
 
-await test('worker configuration does not require the API token or HTTP port', () => {
+await test('worker configuration does not require the API token, app secret or HTTP port', () => {
   const worker = loadWorkerEnv({
     WHATSAPP_VERIFY_TOKEN: '',
+    WHATSAPP_APP_SECRET: '',
     PORT: 'not-an-http-port',
     REDIS_HOST: '127.0.0.1',
     REDIS_PORT: '6380',
@@ -38,7 +45,65 @@ await test('worker configuration does not require the API token or HTTP port', (
   assert.throws(() => loadApiEnv({ WHATSAPP_VERIFY_TOKEN: '' }), /WHATSAPP_VERIFY_TOKEN/);
 });
 
-const apiSettings = { WHATSAPP_VERIFY_TOKEN: 'synthetic-token' };
+const apiSettings = {
+  WHATSAPP_VERIFY_TOKEN: 'synthetic-token',
+  WHATSAPP_APP_SECRET: 'synthetic-app-secret',
+};
+
+for (const appSecret of [undefined, '', ' \t ']) {
+  await test(`API configuration rejects an absent or blank app secret: ${JSON.stringify(appSecret)}`, () => {
+    assert.throws(
+      () =>
+        loadApiEnv({
+          ...apiSettings,
+          WHATSAPP_APP_SECRET: appSecret,
+          DATABASE_URL: 'postgresql://db.internal/litebot',
+        }),
+      /WHATSAPP_APP_SECRET must be configured with a non-empty value/,
+    );
+  });
+}
+
+await test('API configuration preserves app secret bytes for signature verification', () => {
+  const appSecret = ' synthetic-app-secret ';
+  const env = loadApiEnv({
+    ...apiSettings,
+    WHATSAPP_APP_SECRET: appSecret,
+    DATABASE_URL: 'postgresql://db.internal/litebot',
+  });
+  assert.equal(env.whatsappAppSecret, appSecret);
+});
+
+await test('reconciliation configuration only needs database, Redis and log settings', () => {
+  const env = loadReconciliationEnv({
+    DATABASE_URL: 'postgresql://127.0.0.1:1/litebot',
+    LOG_LEVEL: 'warn',
+    REDIS_HOST: '127.0.0.1',
+    REDIS_PORT: '6380',
+    PORT: 'not-an-http-port',
+    WHATSAPP_VERIFY_TOKEN: '',
+    WHATSAPP_APP_SECRET: '',
+    WHATSAPP_ACCESS_TOKEN: '',
+    WHATSAPP_PHONE_NUMBER_ID: '',
+    AI_PROVIDER: 'unsupported-provider',
+    AZURE_AI_FOUNDRY_ENDPOINT: '',
+    AZURE_AI_FOUNDRY_API_KEY: '',
+  });
+  assert.deepEqual(env, {
+    databaseUrl: 'postgresql://127.0.0.1:1/litebot',
+    logLevel: 'warn',
+    redis: { host: '127.0.0.1', port: 6380 },
+  });
+  assert.throws(() => loadReconciliationEnv({}), /DATABASE_URL/);
+  assert.throws(
+    () =>
+      loadReconciliationEnv({
+        DATABASE_URL: 'postgresql://127.0.0.1:1/litebot',
+        LOG_LEVEL: 'not-a-log-level',
+      }),
+    /LOG_LEVEL/,
+  );
+});
 
 for (const databaseUrl of [
   undefined,

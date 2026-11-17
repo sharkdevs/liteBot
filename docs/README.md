@@ -4,18 +4,20 @@ This guide explains how liteBot is built, one stage at a time. Each chapter
 describes what that stage added, why it was needed, how it works, and how to
 check it yourself. Read the chapters in order; later ones build on earlier ones.
 
-| Chapter                                                         | You will learn                                                                                                                              |
-| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| [1. Bootstrap](01-bootstrap.md)                                 | How the project is set up, how a request reaches `/health`, and why each tool exists                                                        |
-| [2. Webhook Foundation (Phase 1)](02-webhook-foundation.md)     | Ownership verification, dashboard/tunnel setup, payload validation, safe logging, and HTTP errors                                           |
-| [3. Queue Infrastructure (Phase 2)](03-queue-infrastructure.md) | Webhook → BullMQ → worker, job contract, correlation IDs, retries, shutdown, delivery limits, and who starts workers                        |
-| [4. Persistence Layer (Phase 3)](04-persistence-layer.md)       | PostgreSQL as the source of truth, the data model and WhatsApp conversations, migrations, repositories, transactions, locks, and duplicates |
-| [5. AI Integration (Phase 4)](05-ai-integration.md)             | Provider abstraction, prompt construction, recent context from PostgreSQL, Azure AI Foundry, and saved-but-unsent responses                 |
+| Chapter                                                              | You will learn                                                                                                                                |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| [1. Bootstrap](01-bootstrap.md)                                      | How the project is set up, how a request reaches `/health`, and why each tool exists                                                          |
+| [2. Webhook Foundation (Phase 1)](02-webhook-foundation.md)          | Ownership verification, dashboard/tunnel setup, payload validation, safe logging, and HTTP errors                                             |
+| [3. Queue Infrastructure (Phase 2)](03-queue-infrastructure.md)      | Webhook → BullMQ → worker, job contract, correlation IDs, retries, shutdown, delivery limits, and who starts workers                          |
+| [4. Persistence Layer (Phase 3)](04-persistence-layer.md)            | PostgreSQL as the source of truth, the data model and WhatsApp conversations, migrations, repositories, transactions, locks, and duplicates   |
+| [5. AI Integration (Phase 4)](05-ai-integration.md)                  | Provider abstraction, prompt construction, recent context from PostgreSQL, Azure AI Foundry, and saved-but-unsent responses                   |
+| [6. Outbound WhatsApp Messaging (Phase 5)](06-outbound-messaging.md) | Separate generation and transport, Cloud API authentication, outgoing jobs, acceptance receipts, retry classification, and persisted statuses |
 
 The user numbers the implementation phases from the webhook work, so Phase 1 is
-Chapter 2, Phase 2 is Chapter 3, Phase 3 is Chapter 4, and Phase 4 is Chapter 5;
+Chapter 2, Phase 2 is Chapter 3, Phase 3 is Chapter 4, Phase 4 is Chapter 5,
+and Phase 5 is Chapter 6;
 the earlier bootstrap stays Chapter 1. Future chapters can cover authenticated
-deliveries, WhatsApp sending, and reliability improvements. Automatic worker
+deliveries, delivery-status webhooks, and reliability improvements. Automatic worker
 startup and scaling will be revisited after the end-to-end proof of concept works
 ([Chapter 3, section 13](03-queue-infrastructure.md#13-who-starts-the-worker-automatic-scaling-is-deferred)).
 
@@ -54,8 +56,8 @@ Terms are added here as chapters introduce them.
 | Asynchronous                 | Done later, outside the request that asked for it, so the caller does not wait for the work to finish.                                                              |
 | Queue                        | A waiting list of work items; producers add items and consumers take them out in order.                                                                             |
 | Job                          | One unit of queued work; here, one incoming text message plus its correlation ID.                                                                                   |
-| Producer                     | The code that adds jobs to a queue; here, the webhook in the API process.                                                                                           |
-| Worker (consumer)            | A process that takes jobs from a queue and processes them; here, `src/worker.ts`.                                                                                   |
+| Producer                     | Code that adds jobs to a queue: the API produces incoming jobs, and the AI worker produces outgoing jobs.                                                           |
+| Worker (consumer)            | A process that takes jobs from a queue: `src/worker.ts` generates replies and `src/whatsapp.worker.ts` sends them.                                                  |
 | Redis                        | An in-memory data store; BullMQ keeps its queues there.                                                                                                             |
 | BullMQ                       | A Node.js job-queue library built on Redis, with retries, backoff, and job states.                                                                                  |
 | Exponential backoff          | Waiting longer before each retry, typically doubling the delay (here ~1 s, then ~2 s).                                                                              |
@@ -110,3 +112,13 @@ Terms are added here as chapters introduce them.
 | System prompt                | An application-authored instruction that establishes the assistant's role for a model request.                                                                      |
 | Model deployment             | A named model endpoint configured in Azure AI Foundry; the deployment name is sent in the request's `model` field.                                                  |
 | Chat completion              | A generated assistant message based on an ordered list of system, user, and assistant messages.                                                                     |
+| Acceptance receipt           | Meta's response ID confirming it accepted a send request; not proof of recipient delivery.                                                                          |
+| Bearer token                 | A secret sent in an Authorization header; whoever holds it can exercise its permissions.                                                                            |
+| Transient vs permanent error | A temporary failure worth retrying versus a rejection that needs configuration, input, or policy changes.                                                           |
+| `UnrecoverableError`         | BullMQ's way to stop automatic retries for a permanently failing job.                                                                                               |
+| Reply link                   | A unique `reply_to_message_id` associating a saved AI reply with the inbound message that caused it.                                                                |
+| Reconciliation               | Comparing external, queue, and database state after failures to find and repair inconsistencies.                                                                    |
+| Webhook signature            | An HMAC-SHA256 of the original request bytes, verified with the Meta app secret before accepting a POST.                                                            |
+| Dispatch intent              | Durable authorization to publish a reply, saved with the response so a relay can recover after a crash.                                                             |
+| Unknown acceptance           | A reserved send whose provider outcome is uncertain; automatic resend is blocked until an operator reconciles it.                                                   |
+| Recipient pacing             | A database-enforced minimum interval between send attempts to one user, shared by every sender replica.                                                             |

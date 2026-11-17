@@ -42,9 +42,10 @@ src/
 
 - `GET /health` returns `{"status":"healthy","service":"whatsapp-ai-assistant"}`.
 - `GET /webhook` supports Meta verification using an environment-provided verification token.
-- `POST /webhook` validates inbound events, persists messages, enqueues work, and responds promptly.
-- A message worker loads conversation history, builds a prompt, calls the AI provider, saves the response, and calls the WhatsApp provider.
-- Do not implement actual WhatsApp message sending yet; provide an interface and placeholder.
+- `POST /webhook` authenticates Meta's signature over the raw body, validates inbound events, persists messages, enqueues work, and responds promptly.
+- An AI worker loads conversation history, builds a prompt, calls the AI provider, saves the response, and publishes an outgoing job.
+- A separate WhatsApp worker consumes outgoing jobs and calls the WhatsApp provider. Never send WhatsApp messages directly from the AI worker.
+- Persist authenticated dispatch intent with the reply and recover missed publications. Serialize and pace sends per recipient across replicas. Never automatically resend an uncertain acceptance; require explicit reconciliation.
 - Define an `IAiProvider.generateResponse(userMessage, conversationHistory)` method and an Azure OpenAI implementation injected through its constructor.
 - Model `User` (`id`, `phoneNumber`, `createdAt`), `Conversation` (`id`, `userId`, `createdAt`, `updatedAt`), and `Message` (`id`, `conversationId`, `direction`, `content`, `createdAt`); message direction is `INBOUND` or `OUTBOUND`.
 - Add a cache-service abstraction for Redis-backed conversation caching.

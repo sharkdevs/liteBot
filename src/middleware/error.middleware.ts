@@ -3,6 +3,7 @@ import type { Logger } from 'pino';
 
 import { BadRequestError } from '../shared/utils/bad-request-error.js';
 import { getCorrelationId } from './request-id.middleware.js';
+import { WebhookAuthenticationError } from './webhook-authentication.middleware.js';
 
 function isBodyParserError(error: unknown): boolean {
   return (
@@ -20,6 +21,14 @@ export function createErrorMiddleware(logger: Logger): ErrorRequestHandler {
   return (error: unknown, req, res, next): void => {
     if (res.headersSent) {
       next(error);
+      return;
+    }
+    if (error instanceof WebhookAuthenticationError) {
+      logger.warn(
+        { correlationId: getCorrelationId(req), eventType: 'webhook_authentication_rejected' },
+        'Webhook authentication rejected',
+      );
+      res.status(403).json({ error: 'Forbidden' });
       return;
     }
     if (error instanceof BadRequestError || isBodyParserError(error)) {

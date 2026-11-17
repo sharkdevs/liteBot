@@ -4,15 +4,18 @@ A backend for a **WhatsApp AI assistant**, built as a learning project. It start
 small proof of concept, but is organised so it can grow into a distributed,
 multi-region system without a rewrite.
 
-> **Current status: Phase 4 — AI Integration.** `GET /webhook` verifies
+> **Current status: Phase 5 — Outbound WhatsApp Messaging.** `GET /webhook` verifies
 > ownership. `POST /webhook` validates events, saves each supported text message
 > (with its sender and conversation) in PostgreSQL, puts a job for it on a BullMQ
 > queue in Redis, then acknowledges. A separate worker loads recent history,
 > generates an AI response through `IAiProvider`, and stores it as an `OUTBOUND`
-> message. It does not send WhatsApp messages. See
+> message with `PENDING` status, then publishes to `outgoing-messages`. A dedicated
+> WhatsApp worker sends it through Meta and records `SENT`, `FAILED`, or
+> `UNKNOWN` acceptance requiring operator reconciliation. See
 > [Persistence Layer](#persistence-layer),
 > [Asynchronous Processing](#asynchronous-processing),
-> [AI Architecture](#ai-architecture), and
+> [AI Architecture](#ai-architecture),
+> [Outbound Messaging Pipeline](#outbound-messaging-pipeline), and
 > [Implementation phases](#implementation-phases).
 
 New here? Read the [learning guide](docs/README.md). It explains each stage from
@@ -25,13 +28,16 @@ first principles, in the order it was built. The full target requirements live i
 2. Meta's WhatsApp Cloud API forwards it to our **webhook**.
 3. We save the message and put a **job** on a queue, then reply to Meta at once.
 4. A separate **worker** process picks up the job, loads the conversation history,
-   asks the configured **AI provider** for a reply, and saves it. Sending it back
-   through WhatsApp is not implemented.
+   asks the configured **AI provider** for a reply, saves it, and publishes an outgoing job.
+5. A separate **WhatsApp worker** sends the reply and records Meta's acceptance.
 
 ## Architecture vision
 
-The Webhook API → PostgreSQL → BullMQ → Worker → AI provider path is implemented
-through Phase 4. WhatsApp sending remains future work.
+The Webhook API → PostgreSQL → BullMQ → AI worker path now connects to a second
+queue and a dedicated WhatsApp worker. POST requests require Meta's raw-body
+signature. Durable publication recovery, recipient ordering/pacing, and
+fail-closed handling of uncertain sends protect the outbound path. This remains
+a learning PoC, not a fully operated production deployment.
 
 ```text
  WhatsApp user
@@ -61,6 +67,15 @@ through Phase 4. WhatsApp sending remains future work.
                                          │
                                          ▼
                                  PostgreSQL reply
+                                         │
+                                         ▼
+                              outgoing-messages queue
+                                         │
+                                         ▼
+                                 WhatsApp worker
+                                         │
+                                         ▼
+                                WhatsApp Cloud API
 ```
 
 Why split the API from the worker? Meta expects a fast reply to every webhook
@@ -86,7 +101,10 @@ the slow work happens elsewhere. The two can then be scaled independently.
 **Prerequisites:** Node.js 22.13+ on the 22.x release line, or Node.js 24+, npm,
 and Docker Desktop (or another Docker engine). The Node minimum matches ESLint's
 supported Node versions. PostgreSQL and Redis must be running for webhook
-processing; the worker also needs a configured Azure AI Foundry deployment.
+processing; the AI worker also needs a configured Azure AI Foundry deployment.
+The optional-to-start WhatsApp worker requires Meta sending credentials and
+**sends real messages**. Leave it stopped when using synthetic curl/dashboard
+examples. See [Chapter 6](docs/06-outbound-messaging.md#6-run-safely) before starting it.
 
 For step 3 below, follow [Generate your verification token](#generate-your-verification-token)
 for the exact command and `.env` instructions.
@@ -100,6 +118,8 @@ Copy-Item .env.example .env        # macOS/Linux: cp .env.example .env
 
 # 3. Generate a private token and save it as WHATSAPP_VERIFY_TOKEN in .env.
 #    An existing .env from the bootstrap stage needs this setting too.
+#    Set WHATSAPP_APP_SECRET to your Meta app secret for POST authentication.
+#    For local-only synthetic tests, choose a private test secret and use it to sign requests.
 #    Set AZURE_AI_FOUNDRY_ENDPOINT, AZURE_AI_FOUNDRY_API_KEY, and AZURE_AI_MODEL
 #    for the worker. The model value is the deployment name; see docs/05-ai-integration.md.
 
@@ -108,6 +128,7 @@ docker compose up -d --wait
 
 # 5. Generate Prisma Client and create the database tables.
 #    Repeat both after pulling a change that adds a migration.
+#    Stop existing API/workers before applying schema changes.
 npm run prisma:generate
 npm run prisma:migrate:deploy
 
@@ -116,6 +137,11 @@ npm run dev
 
 # 7. In a second terminal, run the worker with auto-reload
 npm run dev:worker
+
+# 8. Only for a deliberate isolated messaging test, in a third terminal:
+#    Set WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID first.
+#    This consumes waiting outgoing jobs and sends them.
+npm run dev:whatsapp
 ```
 
 Check it works:
@@ -126,7 +152,8 @@ curl http://localhost:3000/health
 ```
 
 The API logs `HTTP server listening` and `Redis connection ready`; the worker logs
-`Redis connection ready` and `Incoming message worker ready`. Prisma connects
+`Redis connection ready` and `Incoming message worker ready`. The sending worker
+logs `WhatsApp worker ready`. Prisma connects
 lazily, so a wrong `DATABASE_URL` appears when a message is persisted or processed.
 
 Stop these services with `docker compose down` (add `-v` to delete their data,
@@ -147,6 +174,8 @@ development-only lint dependency advisory.
 | `npm run build`                 | Generate Prisma Client, then compile `src/` to JavaScript in `dist/`             |
 | `npm start`                     | Run the compiled API from `dist/server.js`                                       |
 | `npm run start:worker`          | Run the compiled worker from `dist/worker.js`                                    |
+| `npm run dev:whatsapp`          | Run the dedicated sending worker (`src/whatsapp.worker.ts`); sends waiting jobs  |
+| `npm run start:whatsapp`        | Run the compiled sending worker (`dist/whatsapp.worker.js`)                      |
 | `npm run typecheck`             | Type-check without writing files                                                 |
 | `npm test`                      | Startup, configuration, webhook, prompt, and provider tests (no services needed) |
 | `npm run test:integration`      | Real BullMQ and PostgreSQL tests (needs local Redis and PostgreSQL)              |
@@ -179,6 +208,8 @@ uses its own random key prefix and deletes only its own keys. The PostgreSQL
 tests create a throwaway `litebot_test_<random>` database, apply the migrations
 to it, and drop it afterwards, so your development data is never touched. See
 [Chapter 4, section 12](docs/04-persistence-layer.md#12-automated-tests).
+The sending tests use simulated Meta responses; neither test command sends real
+WhatsApp messages. Run unit and integration suites sequentially.
 
 ## Webhook Verification
 
@@ -262,7 +293,8 @@ Remove-Variable verifyToken, encodedToken
 ### GET versus POST
 
 `GET /webhook` is the subscription handshake. `POST /webhook` carries JSON event
-notifications after subscription. Since Phase 2, POST validates the whole
+notifications after subscription. Phase 5 first authenticates the original bytes
+with `WHATSAPP_APP_SECRET`. Since Phase 2, POST validates the whole
 envelope. Since Phase 3, it then saves each supported **text** message in
 PostgreSQL (creating the sender's user and conversation if needed), puts a job
 for each saved message on the `incoming-messages` queue in Redis, and returns
@@ -293,7 +325,16 @@ $payload = @'
   }]
 }
 '@
-Invoke-RestMethod -Method Post -Uri 'http://localhost:3000/webhook' -ContentType 'application/json' -Body $payload
+$appSecret = Read-Host -MaskInput 'Paste WHATSAPP_APP_SECRET from your .env'
+$bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+$hmac = [Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($appSecret))
+$signature = 'sha256=' + [Convert]::ToHexString($hmac.ComputeHash($bytes)).ToLowerInvariant()
+try {
+  Invoke-RestMethod -Method Post -Uri 'http://localhost:3000/webhook' -ContentType 'application/json' -Headers @{ 'X-Hub-Signature-256' = $signature } -Body $bytes
+} finally {
+  $hmac.Dispose()
+  Remove-Variable appSecret, hmac, signature, bytes
+}
 # OK
 ```
 
@@ -301,18 +342,19 @@ This request now writes a user, a conversation, and a message to your
 development database. [Chapter 4, section 11](docs/04-persistence-layer.md#11-run-it-yourself)
 shows how to inspect those rows and delete them afterwards.
 
-Malformed envelopes, invalid JSON, unsupported body formats, oversized bodies,
+For authenticated requests, malformed envelopes, invalid JSON, unsupported body formats, oversized bodies,
 and text messages without a body or numeric timestamp return `400`. If
 PostgreSQL cannot save the message, Redis cannot accept the jobs, or another
 unexpected failure happens, the response is a generic `500` so Meta retries
 later. `/health` still returns `{"status":"healthy"}` and checks neither
 PostgreSQL nor Redis.
 
-**Local foundation, not a public deployment yet:** a successful GET handshake
-does not authenticate subsequent POST requests. Signature checking
-(`X-Hub-Signature-256`) is not implemented yet, so anyone who can reach
-`/webhook` can create database rows and queue jobs. Before accepting real
-traffic, add signature verification and HTTPS. Logs deliberately omit message
+**Authentication is separate from the GET handshake:** POST requires a valid
+`X-Hub-Signature-256` HMAC of the exact request bytes, using the Meta app secret,
+not the verification token or sending access token. Missing, malformed, or
+mismatched signatures are rejected before persistence or queue publication.
+Use HTTPS and appropriate operational safeguards before accepting real traffic.
+Keep the WhatsApp worker stopped for synthetic local examples. Logs omit message
 text, contact profiles, unknown payload fields, query strings, and request
 headers; phone numbers are still personal data and require appropriate log
 controls. Phone numbers and message text are stored in PostgreSQL, and queued
@@ -336,15 +378,15 @@ Meta -> https://<your-tunnel-host>/webhook -> tunnel -> http://localhost:3000/we
 networking problem; it does not add webhook authentication.
 
 For production, use a stable, always-on HTTPS endpoint (for example on Azure App
-Service or Azure Container Apps) after implementing signature verification and
-the other production safeguards. A laptop and temporary tunnel are not that setup.
+Service or Azure Container Apps) with the app secret and other production
+safeguards configured. A laptop and temporary tunnel are not that setup.
 
 ### Connect to the Meta dashboard
 
-**Testing boundary:** the current receiver does not verify POST signatures.
-The following is a short, controlled exercise using a development app/test
-resources and Meta's sample event, not real customer traffic. While a tunnel is
-open, anyone who reaches its URL can send fake events. If your app is already
+**Testing boundary:** configure `WHATSAPP_APP_SECRET` with this development
+app's secret so its POST signatures verify. The following is a short, controlled
+exercise using test resources and Meta's sample event, not real customer traffic.
+Leave the WhatsApp worker stopped for synthetic samples. If your app is already
 connected to production accounts, do not point it at this receiver. Stop the
 tunnel after the exercise.
 
@@ -455,8 +497,9 @@ The worker terminal then logs `Incoming message processing started` and
 `Incoming message processing completed` with the same `correlationId`. If you
 send the sample again and it carries the same message ID, the API logs
 `Inbound message already saved` instead and the worker has nothing new to do.
-**No WhatsApp reply is expected:** the worker stores an AI-generated `OUTBOUND`
-message, but sending it through WhatsApp is not implemented.
+**Keep the WhatsApp worker stopped for dashboard samples.** The AI worker stores
+an `OUTBOUND` reply and queues it, but nothing is sent until the dedicated
+WhatsApp worker runs. Do not start it to consume synthetic sample recipients.
 
 The dashboard sample proves that the callback path works. It does not prove
 that a real phone number/account is correctly connected or subscribed. Real
@@ -474,20 +517,22 @@ tunnel is stopped.
 
 ### Dashboard troubleshooting
 
-| Symptom                                                           | Check                                                                                                                                   |
-| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Verification times out or the tunnel returns 502                  | Both processes are running; ngrok targets the same port as `PORT`; the public hostname is current                                       |
-| Verification returns 403                                          | The Verify token exactly matches `.env`; restart after changing it; do not use a WhatsApp access token                                  |
-| Callback returns 404 or health JSON                               | The Callback URL must end in `/webhook`, not `/health` or just the host                                                                 |
-| Opening `/webhook` directly in a browser returns 403              | Expected without Meta's verification query parameters; this alone does not mean the endpoint is broken                                  |
-| Meta receives a login page or other HTML                          | It must reach the actual endpoint without interactive browser authentication or an intervening page                                     |
-| Verification succeeds but there are no POST logs                  | Subscribe to **messages**, use that field's **Test**, and check the same app's callback configuration                                   |
-| A sample POST returns 400                                         | Select the WhatsApp **messages** test, not another webhook object; the receiver validates the envelope                                  |
-| A sample POST returns 500, log says `Can't reach database server` | PostgreSQL is not reachable: run `docker compose up -d --wait`; the API reconnects without a restart                                    |
-| A sample POST returns 500, log shows Prisma error `P2021`         | The tables do not exist yet: run `npm run prisma:migrate:deploy`                                                                        |
-| A sample POST returns 500 for another reason                      | Read the `err` in the API log. If Redis is not reachable, run `docker compose up -d --wait redis`; the API reconnects without a restart |
-| The API logs `Incoming message queued`, worker silent             | Start the worker with `npm run dev:worker`; queued jobs wait in Redis until a worker runs                                               |
-| POST succeeds but there is no WhatsApp reply                      | Expected: Phase 4 stores an AI response as `OUTBOUND`; WhatsApp sending is not implemented                                              |
+| Symptom                                                                 | Check                                                                                                                                                                      |
+| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Verification times out or the tunnel returns 502                        | Both processes are running; ngrok targets the same port as `PORT`; the public hostname is current                                                                          |
+| Verification returns 403                                                | The Verify token exactly matches `.env`; restart after changing it; do not use a WhatsApp access token                                                                     |
+| Callback returns 404 or health JSON                                     | The Callback URL must end in `/webhook`, not `/health` or just the host                                                                                                    |
+| Opening `/webhook` directly in a browser returns 403                    | Expected without Meta's verification query parameters; this alone does not mean the endpoint is broken                                                                     |
+| Meta receives a login page or other HTML                                | It must reach the actual endpoint without interactive browser authentication or an intervening page                                                                        |
+| Verification succeeds but there are no POST logs                        | Subscribe to **messages**, use that field's **Test**, and check the same app's callback configuration                                                                      |
+| A sample POST returns 400                                               | Select the WhatsApp **messages** test, not another webhook object; the receiver validates the envelope                                                                     |
+| A sample POST returns 500, log says `Can't reach database server`       | PostgreSQL is not reachable: run `docker compose up -d --wait`; the API reconnects without a restart                                                                       |
+| A sample POST returns 500, log shows Prisma error `P2021`               | The tables do not exist yet: run `npm run prisma:migrate:deploy`                                                                                                           |
+| POST returns 500 with Prisma `P2022` / `messages.status does not exist` | The running database is behind the code. Check `npx prisma migrate status`, then apply `npm run prisma:migrate:deploy`; restarting the API alone does not apply migrations |
+| A sample POST returns 500 for another reason                            | Read the `err` in the API log. If Redis is not reachable, run `docker compose up -d --wait redis`; the API reconnects without a restart                                    |
+| The API logs `Incoming message queued`, worker silent                   | Start the worker with `npm run dev:worker`; queued jobs wait in Redis until a worker runs                                                                                  |
+| POST succeeds but there is no WhatsApp reply                            | Check the AI worker, then start `npm run dev:whatsapp` deliberately; it is a separate third process. POST 200 only confirms inbound persistence and queue acceptance       |
+| Outgoing message is `FAILED`                                            | Check the logged HTTP/Meta error codes, token, phone number ID, allowed test recipient, and 24-hour service window                                                         |
 
 Sources: [Meta callback configuration](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/create-webhook-endpoint#configure-webhooks),
 [Meta dashboard sample tests](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/set-up-whatsapp-echo-bot),
@@ -546,11 +591,12 @@ each job to one of them. BullMQ does not start workers by itself: today you star
 each one. Automatic startup and scaling are deferred; see
 [the roadmap](#automatic-worker-startup-and-scaling-deferred).
 
-The worker loads recent history from PostgreSQL, generates an answer through
-`IAiProvider`, and stores it as an `OUTBOUND` row. It does not send WhatsApp
-messages. The queued job refers to the already-saved inbound row (see
-[Persistence Layer](#persistence-layer)). Processing is still "at least once":
-a retry after a response is saved can create another response row.
+The AI worker loads recent history from PostgreSQL, generates an answer through
+`IAiProvider`, stores it as an `OUTBOUND` row, then publishes to the outgoing queue.
+It never calls WhatsApp directly. The incoming job refers to the already-saved
+inbound row (see [Persistence Layer](#persistence-layer)). A unique reply link
+lets incoming retries reuse the saved reply instead of regenerating it.
+External delivery remains "at least once"; see the limits below.
 [Chapter 3](docs/03-queue-infrastructure.md) explains the queue's delivery and
 retry behavior.
 
@@ -593,6 +639,62 @@ generated answer as `OUTBOUND`. It does not rely on hidden state retained by a
 model. This is separate from Meta's WhatsApp conversation metadata. The worker
 logs identifiers, the model name, and response length, but never the generated
 message text. See [Chapter 5](docs/05-ai-integration.md) for the full walkthrough.
+
+## Outbound Messaging Pipeline
+
+```text
+Incoming Queue
+      |
+      V
+AI Worker
+      |
+      V
+Outgoing Queue
+      |
+      V
+WhatsApp Worker
+      |
+      V
+WhatsApp Cloud API
+```
+
+Generation and sending have different failure modes. A slow or unavailable Meta
+API must not hold up the AI worker or require another paid model call. The AI
+worker persists the reply as `PENDING`, then publishes its ID and content to
+`outgoing-messages`. The dedicated consumer uses `IWhatsAppProvider`, implemented
+by `WhatsAppCloudApiProvider`, to send the text.
+
+On acceptance, it saves Meta's response ID in `whatsapp_message_id` and changes
+the row to `SENT`; this means **accepted by Meta**, not delivered or read.
+Transient failures get three total attempts with exponential backoff (1 s, 2 s).
+Exhausted retries or permanent API rejections produce `FAILED`. Inbound rows
+have no outbound status (`NULL`). Old Phase 4 replies are backfilled to `PENDING`
+but are not automatically dispatched.
+
+`IWhatsAppProvider.sendTextMessage` returns a typed `{ providerResponseId }`
+receipt rather than `void`, resolving the prompt's simultaneous requirement to
+return/log the acknowledgement. Logs contain IDs, phone number, safe error codes,
+and attempt metadata, never message text, raw provider errors, or access tokens.
+
+Run `npm run dev:whatsapp` separately (compiled: `npm run start:whatsapp`). It
+needs `DATABASE_URL`, Redis, `WHATSAPP_ACCESS_TOKEN`, and
+`WHATSAPP_PHONE_NUMBER_ID`, but no AI credentials. Starting it sends queued work;
+do not start it against a synthetic-test or production queue unintentionally.
+Signature verification is still required before real customer use.
+
+The reply and its authenticated dispatch intent commit together. A bounded relay
+in the WhatsApp process republishes pending intents after a crash or Redis outage,
+using the same job ID without another model call. Legacy unsigned jobs/replies
+are not automatically authorized or sent.
+
+Before HTTP, PostgreSQL serializes claims per recipient and reserves `UNKNOWN`.
+Replies follow saved-outbound order, with at least six seconds between attempts
+across replicas. Lost acknowledgements, process crashes after claiming, or failed
+acceptance writes remain `UNKNOWN` and **never automatically resend**. They block
+newer replies to that recipient until explicit operator reconciliation. This
+trades availability for duplicate prevention; it is not exactly-once delivery.
+See [Chapter 6](docs/06-outbound-messaging.md) for setup, safe verification, status
+queries, error handling, and these reliability tradeoffs.
 
 ## Persistence Layer
 
@@ -651,6 +753,8 @@ users (id, phone_number unique, created_at, updated_at)
                      expires_at, started_at, created_at, updated_at)
         └── messages (id, conversation_id → conversations,
                       whatsapp_message_id unique, direction INBOUND|OUTBOUND,
+                      status PENDING|SENT|FAILED|UNKNOWN nullable,
+                      reply_to_message_id unique nullable → messages,
                       content, created_at)
 ```
 
@@ -703,19 +807,20 @@ its lock, duplicate handling, and this phase's limits from first principles.
 
 Defined in [`.env.example`](.env.example). Copy it to `.env`; never commit `.env`.
 
-| Variable                    | Used from   | Purpose                                                                                    |
-| --------------------------- | ----------- | ------------------------------------------------------------------------------------------ |
-| `PORT`                      | Stage 1     | API HTTP port (default `3000`)                                                             |
-| `LOG_LEVEL`                 | Stage 1     | Pino log level for the API and worker (default `info`)                                     |
-| `DATABASE_URL`              | Phase 3 / 4 | PostgreSQL connection string; required by the API, worker, and Prisma CLI.                 |
-| `REDIS_HOST`, `REDIS_PORT`  | Phase 2     | Redis location for BullMQ, used by the API and worker (defaults `localhost`, `6379`).      |
-| `AI_PROVIDER`               | Phase 4     | AI adapter selection (`azure-foundry` by default; `openai` and `gemini` are placeholders). |
-| `AZURE_AI_FOUNDRY_ENDPOINT` | Phase 4     | Azure AI Foundry OpenAI v1 endpoint, including `/openai/v1/`.                              |
-| `AZURE_AI_FOUNDRY_API_KEY`  | Phase 4     | Foundry resource API key, required by the worker for `azure-foundry`.                      |
-| `AZURE_AI_MODEL`            | Phase 4     | Foundry deployment name passed to the API; example default `phi-4-mini`.                   |
-| `WHATSAPP_VERIFY_TOKEN`     | Phase 1     | Required non-empty token you choose for the GET handshake (API only).                      |
-| `WHATSAPP_ACCESS_TOKEN`     | Later       | Token for calling the WhatsApp Cloud API; not used yet.                                    |
-| `WHATSAPP_PHONE_NUMBER_ID`  | Later       | The WhatsApp business number that will send replies; not used yet.                         |
+| Variable                    | Used from       | Purpose                                                                                            |
+| --------------------------- | --------------- | -------------------------------------------------------------------------------------------------- |
+| `PORT`                      | Stage 1         | API HTTP port (default `3000`)                                                                     |
+| `LOG_LEVEL`                 | Stage 1         | Pino log level for the API and worker (default `info`)                                             |
+| `DATABASE_URL`              | Phase 3 / 4 / 5 | PostgreSQL connection string; required by the API, both workers, and Prisma CLI.                   |
+| `REDIS_HOST`, `REDIS_PORT`  | Phase 2         | Redis location for both queues, used by the API and both workers (defaults `localhost`, `6379`).   |
+| `AI_PROVIDER`               | Phase 4         | AI adapter selection (`azure-foundry` by default; `openai` and `gemini` are placeholders).         |
+| `AZURE_AI_FOUNDRY_ENDPOINT` | Phase 4         | Azure AI Foundry OpenAI v1 endpoint, including `/openai/v1/`.                                      |
+| `AZURE_AI_FOUNDRY_API_KEY`  | Phase 4         | Foundry resource API key, required by the worker for `azure-foundry`.                              |
+| `AZURE_AI_MODEL`            | Phase 4         | Foundry deployment name passed to the API; example default `phi-4-mini`.                           |
+| `WHATSAPP_VERIFY_TOKEN`     | Phase 1         | Required non-empty token you choose for the GET handshake (API only).                              |
+| `WHATSAPP_APP_SECRET`       | Phase 5         | Required by the API to authenticate POST signatures; Meta app secret, not the verify/access token. |
+| `WHATSAPP_ACCESS_TOKEN`     | Phase 5         | Required only by the WhatsApp worker; token authorized to send via the Cloud API.                  |
+| `WHATSAPP_PHONE_NUMBER_ID`  | Phase 5         | Numeric Meta business phone number ID used by the WhatsApp worker, not a recipient number.         |
 
 `TEST_REDIS_PORT` (default `6379`) and `TEST_DATABASE_URL` (default: the Compose
 database on `127.0.0.1:5432`, used only to create and drop throwaway test
@@ -727,6 +832,7 @@ databases) are read only by `npm run test:integration`.
 src/
 ├── server.ts          API entrypoint: Prisma, Redis, queue, HTTP server, shutdown
 ├── worker.ts          Worker entrypoint: Prisma, Redis, AI provider, BullMQ worker, shutdown
+├── whatsapp.worker.ts Sending entrypoint: Prisma, Redis, WhatsApp provider, outbound worker
 ├── app.ts             Builds the Express app (middleware + routes)
 ├── config/            Environment parsing, the shared logger, Redis and Prisma connections
 ├── routes/            URL → handler wiring (/health and /webhook)
@@ -734,9 +840,9 @@ src/
 ├── domain/            Plain types for User, Conversation, Message, and domain errors
 ├── services/          Application logic: message persistence and AI response processing
 ├── repositories/      Database access via Prisma, and the unit of work (transactions)
-├── providers/         AI provider interface, Azure Foundry adapter, and placeholders
-├── queues/            The incoming-messages queue (producer side)
-├── workers/           The incoming-message job processor (consumer side)
+├── providers/         AI adapters and WhatsApp Cloud API adapter behind interfaces
+├── queues/            Incoming and outgoing message queues (producer side)
+├── workers/           Incoming AI and outgoing WhatsApp processors (consumer side)
 ├── middleware/        Correlation IDs and centralized 400/500 responses
 ├── shared/            Cross-cutting types (incl. the job contract), constants, utilities
 └── generated/         Prisma client output (generated; not committed)
@@ -754,9 +860,10 @@ docs/                  Learning guide, one chapter per stage
 | 2                            | BullMQ queue in Redis, separate logging worker, retries, correlation IDs                                                               | ✅ Done  |
 | 3                            | PostgreSQL data model with WhatsApp conversation metadata, migrations, repositories, persisted inbound messages, duplicate recognition | ✅ Done  |
 | 4                            | Prompt building, provider abstraction, Azure AI Foundry generation, persisted `OUTBOUND` responses                                     | ✅ Done  |
-| Future                       | POST signature verification                                                                                                            | Planned  |
-| Future                       | Redis-backed conversation cache (if needed) and WhatsApp message sending                                                               | Planned  |
-| Future                       | Idempotent processing and production durability (for example, a transactional outbox)                                                  | Planned  |
+| 5                            | Dedicated outgoing queue and WhatsApp worker, Cloud API provider, delivery statuses, retries and stable reply IDs                      | ✅ Done  |
+| 5 hardening                  | POST signatures, durable dispatch recovery, uncertain-send reconciliation, recipient ordering and pacing                               | Done     |
+| Future                       | Redis-backed conversation cache (if needed) and delivery-status webhooks                                                               | Planned  |
+| Future                       | Production operations, receipt-status automation, and stronger inbound publication durability                                          | Planned  |
 | After the end-to-end PoC     | Containerized API and worker, automatic restarts, queue-based worker autoscaling                                                       | Deferred |
 
 The current phase follows the user's phase numbering; the original bootstrap
@@ -795,7 +902,8 @@ things outside BullMQ:
 
 **We will revisit this once the proof of concept runs end to end.** Sensible
 limits depend on real job durations, Azure AI Foundry rate limits, and
-per-conversation ordering, none of which exist yet.
+AI-processing concurrency and ordering, which still need a production policy.
+The sender's recipient gate does not serialize AI generation.
 [Chapter 3, section 13](docs/03-queue-infrastructure.md#13-who-starts-the-worker-automatic-scaling-is-deferred)
 explains the idea and the questions to answer first.
 

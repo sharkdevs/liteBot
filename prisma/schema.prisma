@@ -20,12 +20,22 @@ enum MessageDirection {
   @@map("message_direction")
 }
 
+enum MessageStatus {
+  PENDING
+  SENT
+  FAILED
+  UNKNOWN
+
+  @@map("message_status")
+}
+
 model User {
-  id            String         @id @default(uuid(7)) @db.Uuid
-  phoneNumber   String         @unique @map("phone_number")
-  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt     DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
-  conversations Conversation[]
+  id                 String         @id @default(uuid(7)) @db.Uuid
+  phoneNumber        String         @unique @map("phone_number")
+  createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+  nextWhatsappSendAt DateTime?      @map("next_whatsapp_send_at") @db.Timestamptz(3)
+  conversations      Conversation[]
 
   @@map("users")
 }
@@ -58,15 +68,21 @@ model Conversation {
 }
 
 model Message {
-  id                String           @id @default(uuid(7)) @db.Uuid
-  conversationId    String           @map("conversation_id") @db.Uuid
-  conversation      Conversation     @relation(fields: [conversationId], references: [id])
+  id                    String           @id @default(uuid(7)) @db.Uuid
+  conversationId        String           @map("conversation_id") @db.Uuid
+  conversation          Conversation     @relation(fields: [conversationId], references: [id])
   // Meta's ID for the message. Unique, so a redelivered webhook cannot store it
   // twice; optional, because an outbound reply only gets one after it is sent.
-  whatsappMessageId String?          @unique @map("whatsapp_message_id")
-  direction         MessageDirection
-  content           String
-  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  whatsappMessageId     String?          @unique @map("whatsapp_message_id")
+  direction             MessageDirection
+  // Delivery status applies only to outbound messages. SENT means accepted by Meta.
+  status                MessageStatus?
+  dispatchCorrelationId String?          @map("dispatch_correlation_id")
+  replyToMessageId      String?          @unique @map("reply_to_message_id") @db.Uuid
+  replyToMessage        Message?         @relation("MessageReply", fields: [replyToMessageId], references: [id], onDelete: Restrict)
+  reply                 Message?         @relation("MessageReply")
+  content               String
+  createdAt             DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
 
   // Serves "messages in a conversation, oldest first" and the conversation_id foreign key.
   @@index([conversationId, createdAt])

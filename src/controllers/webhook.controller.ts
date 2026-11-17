@@ -2,6 +2,7 @@ import type { Request, Response } from 'express';
 import type { Logger } from 'pino';
 
 import { getCorrelationId } from '../middleware/request-id.middleware.js';
+import { assertWebhookAuthenticated } from '../middleware/webhook-authentication.middleware.js';
 import type { IConversationService } from '../services/conversation.service.js';
 import type {
   IncomingMessageJob,
@@ -57,6 +58,7 @@ export class WebhookController {
     req: Request<Record<string, string>, unknown, unknown>,
     res: Response,
   ): Promise<void> {
+    assertWebhookAuthenticated(req);
     const payload = parseWebhookPayload(req.body);
     const correlationId = getCorrelationId(req);
     this.logger.info(
@@ -120,7 +122,14 @@ export class WebhookController {
           whatsappTimestamp: unixSecondsToDate(message.timestamp),
           content: message.messageText,
         });
-      jobs.push({ correlationId, messageId, userId, conversationId, ...message });
+      jobs.push({
+        correlationId,
+        messageId,
+        userId,
+        conversationId,
+        ...message,
+        webhookVerified: true,
+      });
     }
 
     if (jobs.length > 0) {

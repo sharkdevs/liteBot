@@ -1,12 +1,18 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { readFile } from 'node:fs/promises';
 import { Writable } from 'node:stream';
 import { test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { pino } from 'pino';
 
 import { WhatsappMessageIdConflictError } from '../src/domain/message/message-id-conflict.error.js';
 import { ConversationRepository } from '../src/repositories/conversation.repository.js';
 import { UserRepository } from '../src/repositories/user.repository.js';
+import { MessageRepository } from '../src/repositories/message.repository.js';
+import { PrismaDeliveryRepository } from '../src/repositories/delivery.repository.js';
+import { WhatsAppCloudApiProvider } from '../src/providers/whatsapp/whatsapp-cloud-api.provider.js';
+import { WhatsAppDeliveryService } from '../src/services/whatsapp-delivery.service.js';
 import { PrismaUnitOfWork, type IUnitOfWork } from '../src/repositories/unit-of-work.js';
 import type { IAiProvider } from '../src/providers/ai/index.js';
 import { AiResponseService } from '../src/services/ai-response.service.js';
@@ -14,7 +20,12 @@ import {
   ConversationService,
   type InboundTextMessage,
 } from '../src/services/conversation.service.js';
-import { setupQueue, startWebhook, textMessageWebhook } from './support/queue-fixture.js';
+import {
+  setupQueue,
+  startWebhook,
+  textMessageWebhook,
+  signWebhook,
+} from './support/queue-fixture.js';
 import { createTestDatabase } from './support/test-database.js';
 
 const database = await createTestDatabase();
@@ -60,6 +71,71 @@ await test('persistence layer', async (t) => {
   t.after(() => database.drop());
 
   await t.test(
+    'status migration preserves existing inbound and unsent Phase 4 messages',
+    async () => {
+      const user = await prisma.user.create({ data: { phoneNumber: syntheticPhoneNumber() } });
+      const conversation = await prisma.conversation.create({
+        data: { userId: user.id, startedAt: new Date() },
+      });
+      const migration = await readFile(
+        new URL(
+          '../prisma/migrations/20261116233000_outbound_message_status/migration.sql',
+          import.meta.url,
+        ),
+        'utf8',
+      );
+      await prisma.$transaction(async (tx) => {
+        // Reconstruct the prior schema only inside this throwaway test database.
+        await tx.$executeRawUnsafe(
+          'ALTER TABLE messages DROP COLUMN status, DROP COLUMN reply_to_message_id, DROP COLUMN dispatch_correlation_id',
+        );
+        await tx.$executeRawUnsafe('ALTER TABLE users DROP COLUMN next_whatsapp_send_at');
+        await tx.$executeRawUnsafe('DROP TYPE message_status');
+        await tx.$executeRaw`
+        INSERT INTO messages (id, conversation_id, direction, content)
+        VALUES ('00000000-0000-4000-8000-000000000001', ${conversation.id}::uuid, 'INBOUND', 'Old inbound'),
+               ('00000000-0000-4000-8000-000000000002', ${conversation.id}::uuid, 'OUTBOUND', 'Old reply')
+      `;
+        for (const statement of migration
+          .replace(/^--.*$/gm, '')
+          .split(';')
+          .filter((sql) => sql.trim())) {
+          await tx.$executeRawUnsafe(statement);
+        }
+        const recoveryMigration = await readFile(
+          new URL(
+            '../prisma/migrations/20261117010000_delivery_recovery/migration.sql',
+            import.meta.url,
+          ),
+          'utf8',
+        );
+        for (const statement of recoveryMigration
+          .replace(/^--.*$/gm, '')
+          .split(';')
+          .filter((sql) => sql.trim())) {
+          await tx.$executeRawUnsafe(statement);
+        }
+      });
+      const rows = await prisma.message.findMany({
+        where: { conversationId: conversation.id },
+        orderBy: { id: 'asc' },
+      });
+      assert.ok(rows.every((row) => row.dispatchCorrelationId === null));
+      assert.deepEqual(
+        rows.map(({ content, status, replyToMessageId }) => ({
+          content,
+          status,
+          replyToMessageId,
+        })),
+        [
+          { content: 'Old inbound', status: null, replyToMessageId: null },
+          { content: 'Old reply', status: 'PENDING', replyToMessageId: null },
+        ],
+      );
+    },
+  );
+
+  await t.test(
     'a first message creates a user, a conversation, and an inbound message',
     async () => {
       const { logger, output } = captureLogs();
@@ -85,6 +161,7 @@ await test('persistence layer', async (t) => {
       assert.equal(message.conversationId, conversation.id);
       assert.equal(message.whatsappMessageId, 'wamid.first');
       assert.equal(message.direction, 'INBOUND');
+      assert.equal(message.status, null);
       assert.equal(message.content, 'PRIVATE_MESSAGE_TEXT');
 
       const logs = output();
@@ -96,6 +173,94 @@ await test('persistence layer', async (t) => {
       assert.match(logs, new RegExp(`"messageId":"${message.id}".*"Inbound message saved"`));
       assert.doesNotMatch(logs, /PRIVATE_MESSAGE_TEXT/);
       assert.doesNotMatch(logs, new RegExp(phoneNumber));
+    },
+  );
+
+  await t.test('concurrent reply saves return one immutable response', async () => {
+    const service = new ConversationService(unitOfWork, pino({ level: 'silent' }));
+    const recorded = await service.recordInboundMessage(
+      inbound(syntheticPhoneNumber(), 'wamid.concurrent-reply'),
+    );
+    const { outcomes } = await prisma.$transaction(async (tx) => {
+      // Allow initial reads, but hold inserts until all four transactions reach them.
+      await tx.$executeRaw`LOCK TABLE messages IN SHARE MODE`;
+      const outcomes = Promise.allSettled(
+        Array.from({ length: 4 }, (_, index) =>
+          service.saveOutboundMessage(
+            recorded.conversationId,
+            `Concurrent reply ${String(index)}`,
+            recorded.messageId,
+          ),
+        ),
+      );
+      const deadline = Date.now() + 2000;
+      let waiting: number;
+      do {
+        const [locks] = await tx.$queryRaw<{ waiting: number }[]>`
+          SELECT count(*)::int AS waiting FROM pg_locks
+          WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database())
+            AND relation = 'messages'::regclass
+            AND mode = 'RowExclusiveLock' AND NOT granted
+        `;
+        waiting = locks?.waiting ?? 0;
+        if (waiting < 4) await delay(10);
+      } while (waiting < 4 && Date.now() < deadline);
+      assert.equal(waiting, 4, 'All reply saves must overlap before the lock is released');
+      return { outcomes };
+    });
+    const replies = (await outcomes).map((outcome) => {
+      assert.ok(outcome.status === 'fulfilled', 'Concurrent reply saves must not reject');
+      return outcome.value;
+    });
+    const [reply] = replies;
+    assert.ok(reply);
+    for (const saved of replies) assert.deepEqual(saved, reply);
+    assert.equal(
+      await prisma.message.count({ where: { replyToMessageId: recorded.messageId } }),
+      1,
+    );
+
+    await new MessageRepository(prisma).markSent(reply.id, 'wamid.concurrent-receipt');
+    const replay = await service.saveOutboundMessage(
+      recorded.conversationId,
+      'Do not replace the first response',
+      recorded.messageId,
+    );
+    assert.deepEqual(replay, {
+      ...reply,
+      status: 'SENT',
+      whatsappMessageId: 'wamid.concurrent-receipt',
+    });
+  });
+
+  await t.test(
+    'outbound receipts persist status and a saved reply is reused per inbound message',
+    async () => {
+      const service = new ConversationService(unitOfWork, pino({ level: 'silent' }));
+      const recorded = await service.recordInboundMessage(
+        inbound(syntheticPhoneNumber(), 'wamid.status'),
+      );
+      const replies = await Promise.all([
+        service.saveOutboundMessage(recorded.conversationId, 'First reply', recorded.messageId),
+        service.saveOutboundMessage(recorded.conversationId, 'Second reply', recorded.messageId),
+      ]);
+      assert.equal(replies[0].id, replies[1].id);
+      assert.equal(replies[0].status, 'PENDING');
+      assert.equal(replies[0].whatsappMessageId, null);
+      assert.equal((await service.findReplyToMessage(recorded.messageId))?.id, replies[0].id);
+
+      const repository = new MessageRepository(prisma);
+      await repository.markSent(replies[0].id, 'wamid.sent-receipt');
+      await repository.markFailed(replies[0].id);
+      const sent = await repository.findById(replies[0].id);
+      assert.equal(sent?.status, 'SENT', 'A stale failure cannot overwrite a recorded acceptance');
+      assert.equal(sent.whatsappMessageId, 'wamid.sent-receipt');
+
+      const failed = await service.saveOutboundMessage(recorded.conversationId, 'Failed reply');
+      await repository.markFailed(failed.id);
+      assert.equal((await repository.findById(failed.id))?.status, 'FAILED');
+      await assert.rejects(repository.markSent(recorded.messageId, 'wamid.invalid-inbound-update'));
+      await assert.rejects(repository.markFailed(recorded.messageId));
     },
   );
 
@@ -255,28 +420,17 @@ await test('persistence layer', async (t) => {
 
   await t.test(
     'a failure while saving the message rolls back the user and conversation',
-    async () => {
+    async (t) => {
       const { logger, output } = captureLogs();
       const failingMessageSave: IUnitOfWork = {
         run: (work) => unitOfWork.run(work),
         runExclusive: (lockKey, work) =>
-          unitOfWork.runExclusive(lockKey, (repositories) =>
-            work({
-              ...repositories,
-              messages: {
-                findByWhatsappMessageId: (id) => repositories.messages.findByWhatsappMessageId(id),
-                findRecentMessagesByConversation: (conversationId, limit, excludeMessageId) =>
-                  repositories.messages.findRecentMessagesByConversation(
-                    conversationId,
-                    limit,
-                    excludeMessageId,
-                  ),
-                saveOutboundMessage: (conversationId, content) =>
-                  repositories.messages.saveOutboundMessage(conversationId, content),
-                create: () => Promise.reject(new Error('Simulated database failure')),
-              },
-            }),
-          ),
+          unitOfWork.runExclusive(lockKey, (repositories) => {
+            t.mock.method(repositories.messages, 'create', () =>
+              Promise.reject(new Error('Simulated database failure')),
+            );
+            return work(repositories);
+          }),
       };
       const service = new ConversationService(failingMessageSave, logger);
       const phoneNumber = syntheticPhoneNumber();
@@ -351,7 +505,7 @@ await test('persistence layer', async (t) => {
 
   await t.test(
     'a webhook request saves the message, then a worker consumes its job',
-    { timeout: 20_000 },
+    { timeout: 30_000 },
     async (t) => {
       const fixture = await setupQueue(t);
       const service = new ConversationService(unitOfWork, fixture.logger);
@@ -374,7 +528,11 @@ await test('persistence layer', async (t) => {
       const post = () =>
         fetch(url, {
           method: 'POST',
-          headers: { 'content-type': 'application/json', 'x-correlation-id': 'e2e-correlation' },
+          headers: {
+            'content-type': 'application/json',
+            'x-correlation-id': 'e2e-correlation',
+            'x-hub-signature-256': signWebhook(body),
+          },
           body,
         });
 
@@ -397,6 +555,7 @@ await test('persistence layer', async (t) => {
       const [job] = await fixture.inspector.getWaiting();
       assert.equal(job?.id, message.id);
       assert.deepEqual(job.data, {
+        webhookVerified: true,
         correlationId: 'e2e-correlation',
         messageId: message.id,
         userId: user.id,
@@ -422,6 +581,7 @@ await test('persistence layer', async (t) => {
         provider,
         'phi-4-mini',
         fixture.logger,
+        fixture.outgoingQueue,
       );
       const worker = fixture.startWorker((incomingJob) => aiResponseService.process(incomingJob));
       await once(worker, 'completed', { signal: AbortSignal.timeout(10_000) });
@@ -447,6 +607,56 @@ await test('persistence layer', async (t) => {
         },
       });
       assert.equal(savedResponse.whatsappMessageId, null);
+      assert.equal(savedResponse.status, 'PENDING');
+      const outgoing = await fixture.outgoingInspector.getJob(savedResponse.id);
+      assert.equal(outgoing?.data.content, savedResponse.content);
+      assert.equal(outgoing.data.phoneNumber, phoneNumber);
+      assert.equal(outgoing.data.correlationId, 'e2e-correlation');
+      assert.equal(
+        await outgoing.getState(),
+        'waiting',
+        'AI completion does not wait for transport',
+      );
+      let sends = 0;
+      const attempts: number[] = [];
+      const transport = new WhatsAppCloudApiProvider(
+        { accessToken: 'SYNTHETIC_TOKEN', phoneNumberId: '123456789' },
+        async (_url, init) => {
+          sends++;
+          attempts.push(performance.now());
+          assert.equal(
+            (await prisma.message.findUniqueOrThrow({ where: { id: savedResponse.id } })).status,
+            'UNKNOWN',
+          );
+          assert.ok(typeof init?.body === 'string');
+          const payload = JSON.parse(init.body) as { to: string; text: { body: string } };
+          assert.equal(payload.to, phoneNumber);
+          assert.equal(payload.text.body, 'Synthetic AI response');
+          if (sends < 3) {
+            return Response.json(
+              { error: { code: 131016, message: 'PRIVATE_META_FAILURE' } },
+              { status: 503 },
+            );
+          }
+          return Response.json({ messages: [{ id: 'wamid.outbound-accepted' }] });
+        },
+      );
+      const whatsappWorker = fixture.startWhatsAppWorker(
+        new WhatsAppDeliveryService(
+          new PrismaDeliveryRepository(prisma),
+          transport,
+          fixture.logger,
+        ),
+      );
+      await once(whatsappWorker, 'completed', { signal: AbortSignal.timeout(25_000) });
+      assert.equal(sends, 3);
+      assert.ok((attempts[1] ?? 0) - (attempts[0] ?? 0) >= 900);
+      assert.ok((attempts[2] ?? 0) - (attempts[1] ?? 0) >= 1900);
+      const accepted = await prisma.message.findUniqueOrThrow({ where: { id: savedResponse.id } });
+      assert.equal(accepted.status, 'SENT');
+      assert.equal(accepted.whatsappMessageId, 'wamid.outbound-accepted');
+      assert.match(fixture.logs.join(''), /"providerResponseId":"wamid.outbound-accepted"/);
+      assert.doesNotMatch(fixture.logs.join(''), /PRIVATE_META_FAILURE|SYNTHETIC_TOKEN/);
 
       // Meta retries a delivery it thinks failed: nothing new is saved or queued.
       assert.equal((await post()).status, 200);
@@ -456,4 +666,70 @@ await test('persistence layer', async (t) => {
       assert.doesNotMatch(fixture.logs.join(''), /Synthetic AI response/);
     },
   );
+
+  for (const [label, status, code, expectedAttempts] of [
+    ['exhausted transient errors', 503, 131016, 3],
+    ['permanent authentication error', 401, 190, 1],
+  ] as const) {
+    await t.test(
+      `outbound ${label} persist FAILED without regenerating AI`,
+      { timeout: 25_000 },
+      async (t) => {
+        const fixture = await setupQueue(t);
+        const service = new ConversationService(unitOfWork, fixture.logger);
+        const phoneNumber = syntheticPhoneNumber();
+        const recorded = await service.recordInboundMessage(
+          inbound(phoneNumber, `wamid.${String(code)}`),
+        );
+        const reply = await service.saveOutboundMessage(
+          recorded.conversationId,
+          'PRIVATE_FAILED_REPLY',
+          recorded.messageId,
+          'outgoing-failure',
+        );
+        let requests = 0;
+        const provider = new WhatsAppCloudApiProvider(
+          { accessToken: 'SYNTHETIC_TOKEN', phoneNumberId: '123456789' },
+          () => {
+            requests++;
+            return Promise.resolve(
+              Response.json({ error: { code, message: 'PRIVATE_META_FAILURE' } }, { status }),
+            );
+          },
+        );
+        const worker = fixture.startWhatsAppWorker(
+          new WhatsAppDeliveryService(
+            new PrismaDeliveryRepository(prisma),
+            provider,
+            fixture.logger,
+          ),
+        );
+        const exhausted = new Promise<void>((resolve) => {
+          worker.on('failed', (job) => {
+            if (job?.attemptsMade === expectedAttempts) resolve();
+          });
+        });
+        await fixture.outgoingQueue.enqueue({
+          phoneNumber,
+          conversationId: recorded.conversationId,
+          messageId: reply.id,
+          content: reply.content,
+          correlationId: 'outgoing-failure',
+          userId: recorded.userId,
+        });
+        await exhausted;
+        assert.equal(requests, expectedAttempts);
+        assert.equal(
+          (await prisma.message.findUniqueOrThrow({ where: { id: reply.id } })).status,
+          'FAILED',
+        );
+        assert.equal(await fixture.outgoingInspector.getFailedCount(), 1);
+        assert.equal(await fixture.outgoingInspector.getCompletedCount(), 0);
+        assert.doesNotMatch(
+          fixture.logs.join(''),
+          /PRIVATE_FAILED_REPLY|PRIVATE_META_FAILURE|SYNTHETIC_TOKEN/,
+        );
+      },
+    );
+  }
 });

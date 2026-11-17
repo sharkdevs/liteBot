@@ -26,14 +26,29 @@ interface RuntimeEnv {
   readonly redis: RedisSettings;
 }
 
+export interface ReconciliationEnv extends RuntimeEnv {
+  readonly databaseUrl: string;
+}
+
 export interface WorkerEnv extends RuntimeEnv {
   readonly databaseUrl: string;
   readonly ai: AiSettings;
 }
 
+export interface WhatsAppSettings {
+  readonly accessToken: string;
+  readonly phoneNumberId: string;
+}
+
+export interface WhatsAppWorkerEnv extends RuntimeEnv {
+  readonly databaseUrl: string;
+  readonly whatsapp: WhatsAppSettings;
+}
+
 export interface Env extends RuntimeEnv {
   readonly port: number;
   readonly whatsappVerifyToken: string;
+  readonly whatsappAppSecret: string;
   readonly databaseUrl: string;
 }
 
@@ -56,6 +71,13 @@ function parseLogLevel(value: string | undefined): LogLevel {
 function parseVerifyToken(value: string | undefined): string {
   if (!value || value.trim().length === 0) {
     throw new Error('WHATSAPP_VERIFY_TOKEN must be configured with a non-empty value');
+  }
+  return value;
+}
+
+function parseAppSecret(value: string | undefined): string {
+  if (!value?.trim()) {
+    throw new Error('WHATSAPP_APP_SECRET must be configured with a non-empty value');
   }
   return value;
 }
@@ -149,11 +171,35 @@ export function loadWorkerEnv(source: NodeJS.ProcessEnv = process.env): WorkerEn
   });
 }
 
+export function loadReconciliationEnv(source: NodeJS.ProcessEnv = process.env): ReconciliationEnv {
+  return Object.freeze({
+    ...loadRuntimeEnv(source),
+    databaseUrl: parseDatabaseUrl(source.DATABASE_URL),
+  });
+}
+
 export function loadApiEnv(source: NodeJS.ProcessEnv = process.env): Env {
   return Object.freeze({
     port: parsePort(source.PORT, 'PORT', 3000),
     whatsappVerifyToken: parseVerifyToken(source.WHATSAPP_VERIFY_TOKEN),
+    whatsappAppSecret: parseAppSecret(source.WHATSAPP_APP_SECRET),
     ...loadRuntimeEnv(source),
     databaseUrl: parseDatabaseUrl(source.DATABASE_URL),
+  });
+}
+
+export function loadWhatsAppWorkerEnv(source: NodeJS.ProcessEnv = process.env): WhatsAppWorkerEnv {
+  const accessToken = source.WHATSAPP_ACCESS_TOKEN?.trim();
+  const phoneNumberId = source.WHATSAPP_PHONE_NUMBER_ID?.trim();
+  if (!accessToken || !/^[!-~]+$/.test(accessToken)) {
+    throw new Error('WHATSAPP_ACCESS_TOKEN must be a non-empty token without whitespace');
+  }
+  if (!phoneNumberId || !/^[0-9]+$/.test(phoneNumberId)) {
+    throw new Error('WHATSAPP_PHONE_NUMBER_ID must be a numeric business phone number ID');
+  }
+  return Object.freeze({
+    ...loadRuntimeEnv(source),
+    databaseUrl: parseDatabaseUrl(source.DATABASE_URL),
+    whatsapp: Object.freeze({ accessToken, phoneNumberId }),
   });
 }

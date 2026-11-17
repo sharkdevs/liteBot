@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { Writable } from 'node:stream';
 import type { TestContext } from 'node:test';
@@ -10,10 +10,23 @@ import { pino } from 'pino';
 import { createApp } from '../../src/app.js';
 import { createRedisConnection } from '../../src/config/redis.js';
 import { IncomingMessageQueue } from '../../src/queues/message.queue.js';
-import { INCOMING_MESSAGE_QUEUE_NAME } from '../../src/queues/queue.constants.js';
+import { OutgoingMessageQueue } from '../../src/queues/outgoing-message.queue.js';
+import {
+  INCOMING_MESSAGE_QUEUE_NAME,
+  OUTGOING_MESSAGE_QUEUE_NAME,
+} from '../../src/queues/queue.constants.js';
+import type { OutgoingMessageJob } from '../../src/shared/types/outgoing-message-job.js';
 import type { IConversationService } from '../../src/services/conversation.service.js';
 import type { IncomingMessageJob } from '../../src/shared/types/incoming-message-job.js';
 import { createMessageWorker, type MessageProcessor } from '../../src/workers/message.worker.js';
+import { createWhatsAppWorker } from '../../src/workers/whatsapp.worker.js';
+import type { WhatsAppDeliveryService } from '../../src/services/whatsapp-delivery.service.js';
+
+export const webhookAppSecret = 'synthetic-whatsapp-app-secret';
+
+export function signWebhook(body: string): string {
+  return `sha256=${createHmac('sha256', webhookAppSecret).update(body).digest('hex')}`;
+}
 
 /** A queue under a unique Redis key prefix, removed after the test, plus captured logs. */
 export async function setupQueue(t: TestContext) {
@@ -52,13 +65,26 @@ export async function setupQueue(t: TestContext) {
     connection: inspectionConnection,
     prefix,
   });
-  const workers: ReturnType<typeof createMessageWorker>[] = [];
+  const outgoingQueue = new OutgoingMessageQueue(connection, logger, { prefix });
+  const outgoingInspector = new Queue<OutgoingMessageJob>(OUTGOING_MESSAGE_QUEUE_NAME, {
+    connection: inspectionConnection,
+    prefix,
+  });
+  const workers: Array<
+    ReturnType<typeof createMessageWorker> | ReturnType<typeof createWhatsAppWorker>
+  > = [];
   const workerConnections: ReturnType<typeof createRedisConnection>[] = [];
   t.after(async () => {
     try {
       await Promise.all(workers.map((worker) => worker.close()));
       await inspector.obliterate();
-      await Promise.all([queue.close(), inspector.close()]);
+      await outgoingInspector.obliterate();
+      await Promise.all([
+        queue.close(),
+        inspector.close(),
+        outgoingQueue.close(),
+        outgoingInspector.close(),
+      ]);
     } finally {
       connection.disconnect();
       inspectionConnection.disconnect();
@@ -68,13 +94,24 @@ export async function setupQueue(t: TestContext) {
     }
   });
   await inspector.waitUntilReady();
+  await outgoingInspector.waitUntilReady();
   return {
     queue,
+    outgoingQueue,
+    outgoingInspector,
+    prefix,
     inspector,
     logger,
     logs,
     connection,
     settings,
+    startWhatsAppWorker: (delivery: Pick<WhatsAppDeliveryService, 'send' | 'markFailed'>) => {
+      const client = createRedisConnection(settings, logger, 'worker');
+      workerConnections.push(client);
+      const worker = createWhatsAppWorker(client, logger, delivery, { prefix });
+      workers.push(worker);
+      return worker;
+    },
     startWorker: (processMessage: MessageProcessor = () => Promise.resolve()) => {
       const client = createRedisConnection(settings, logger, 'worker');
       workerConnections.push(client);
@@ -96,6 +133,7 @@ export async function startWebhook(
   const server = createApp({
     logger: fixture.logger,
     whatsappVerifyToken: 'integration-verification-token',
+    whatsappAppSecret: webhookAppSecret,
     conversationService,
     incomingMessageQueue: fixture.queue,
   }).listen(0, '127.0.0.1');
