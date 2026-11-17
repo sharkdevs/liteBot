@@ -11,6 +11,7 @@ export const MessageStatus = {
   PENDING: 'PENDING',
   SENT: 'SENT',
   FAILED: 'FAILED',
+  UNKNOWN: 'UNKNOWN',
 } as const;
 
 export type MessageStatus = (typeof MessageStatus)[keyof typeof MessageStatus];

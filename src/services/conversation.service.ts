@@ -34,6 +34,7 @@ export interface IConversationService {
     conversationId: string,
     content: string,
     replyToMessageId?: string,
+    dispatchCorrelationId?: string,
   ): Promise<Message>;
 }
 
@@ -135,9 +136,15 @@ export class ConversationService implements IConversationService {
     conversationId: string,
     content: string,
     replyToMessageId?: string,
+    dispatchCorrelationId?: string,
   ): Promise<Message> {
     return this.unitOfWork.run(({ messages }) =>
-      messages.saveOutboundMessage(conversationId, content, replyToMessageId),
+      messages.saveOutboundMessage(
+        conversationId,
+        content,
+        replyToMessageId,
+        dispatchCorrelationId,
+      ),
     );
   }
 

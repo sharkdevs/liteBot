@@ -1,4 +1,5 @@
 import type { DatabaseClient } from '../config/database.js';
+import type { OutgoingMessageJob } from '../shared/types/outgoing-message-job.js';
 import {
   MessageDirection,
   MessageStatus,
@@ -18,7 +19,9 @@ export interface IMessageRepository {
     conversationId: string,
     content: string,
     replyToMessageId?: string,
+    dispatchCorrelationId?: string,
   ): Promise<Message>;
+  findPendingDispatches(afterId?: string): Promise<OutgoingMessageJob[]>;
   findReplyToMessage(replyToMessageId: string): Promise<Message | null>;
   findById(id: string): Promise<Message | null>;
   markSent(id: string, providerResponseId: string): Promise<void>;
@@ -54,7 +57,11 @@ export class MessageRepository implements IMessageRepository {
     conversationId: string,
     content: string,
     replyToMessageId?: string,
+    dispatchCorrelationId?: string,
   ): Promise<Message> {
+    if (dispatchCorrelationId !== undefined && replyToMessageId === undefined) {
+      throw new Error('Dispatch intent requires an inbound reply link');
+    }
     const data = {
       conversationId,
       whatsappMessageId: null,
@@ -62,6 +69,7 @@ export class MessageRepository implements IMessageRepository {
       status: MessageStatus.PENDING,
       content,
       ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
+      ...(dispatchCorrelationId === undefined ? {} : { dispatchCorrelationId }),
     };
     if (replyToMessageId === undefined) {
       return this.db.message.create({ data });
@@ -78,6 +86,31 @@ export class MessageRepository implements IMessageRepository {
     return this.db.message.findUnique({ where: { replyToMessageId } });
   }
 
+  async findPendingDispatches(afterId?: string): Promise<OutgoingMessageJob[]> {
+    const rows = await this.db.message.findMany({
+      where: {
+        status: MessageStatus.PENDING,
+        direction: MessageDirection.OUTBOUND,
+        dispatchCorrelationId: { not: null },
+        ...(afterId === undefined ? {} : { id: { gt: afterId } }),
+      },
+      include: { conversation: { include: { user: true } } },
+      orderBy: { id: 'asc' },
+      take: 100,
+    });
+    return rows.map((row) => {
+      if (row.dispatchCorrelationId === null) throw new Error('Missing dispatch correlation');
+      return {
+        messageId: row.id,
+        conversationId: row.conversationId,
+        content: row.content,
+        correlationId: row.dispatchCorrelationId,
+        userId: row.conversation.userId,
+        phoneNumber: row.conversation.user.phoneNumber,
+      };
+    });
+  }
+
   findById(id: string): Promise<Message | null> {
     return this.db.message.findUnique({ where: { id } });
   }
@@ -91,13 +124,21 @@ export class MessageRepository implements IMessageRepository {
 
   async markFailed(id: string): Promise<void> {
     const result = await this.db.message.updateMany({
-      where: { id, direction: MessageDirection.OUTBOUND, status: { not: MessageStatus.SENT } },
+      where: {
+        id,
+        direction: MessageDirection.OUTBOUND,
+        status: { in: [MessageStatus.PENDING, MessageStatus.FAILED] },
+      },
       data: { status: MessageStatus.FAILED },
     });
     if (result.count === 0) {
-      // Only a previously recorded acceptance may make this a no-op.
+      // A stale failure must not overwrite confirmed or uncertain acceptance.
       await this.db.message.findUniqueOrThrow({
-        where: { id, direction: MessageDirection.OUTBOUND, status: MessageStatus.SENT },
+        where: {
+          id,
+          direction: MessageDirection.OUTBOUND,
+          status: { in: [MessageStatus.SENT, MessageStatus.UNKNOWN] },
+        },
       });
     }
   }
