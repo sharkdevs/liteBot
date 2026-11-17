@@ -57,7 +57,7 @@ Queue tests use a random BullMQ key prefix and delete only their own keys;
 persistence tests create a `litebot_test_<hex>` database via `TEST_DATABASE_URL`,
 apply migrations with `prisma migrate deploy`, and drop it afterwards. Never
 flush or stop the shared Compose Redis or touch the development database from
-tests. API startup requires a non-empty `WHATSAPP_VERIFY_TOKEN` and a PostgreSQL
+tests. API startup requires non-empty `WHATSAPP_VERIFY_TOKEN` and `WHATSAPP_APP_SECRET`, and a PostgreSQL
 `DATABASE_URL`; AI worker startup requires `DATABASE_URL` and AI settings.
 WhatsApp worker startup requires `DATABASE_URL`, `WHATSAPP_ACCESS_TOKEN`, and
 `WHATSAPP_PHONE_NUMBER_ID`, but no AI settings. Tests inject synthetic
@@ -86,13 +86,13 @@ required column to a table that may have rows.
   the `prisma-client` generator outputs to `src/generated/prisma`, and runtime
   connections use `@prisma/adapter-pg`.
 - Read configuration through the validated loaders in `src/config/env.ts`, not
-  `process.env`: `loadApiEnv()` (port, verify token, log level, Redis, database
+  `process.env`: `loadApiEnv()` (port, verify token, app secret, log level, Redis, database
   URL) for `src/server.ts` and `loadWorkerEnv()` (log level, Redis, database
   URL, AI settings) for `src/worker.ts`. `server.ts` is the API composition
   root: it constructs the logger, Prisma client, Redis connection,
   `IncomingMessageQueue`, and `ConversationService(new PrismaUnitOfWork(prisma), logger)`,
   then injects them into
-  `createApp({ logger, whatsappVerifyToken, conversationService, incomingMessageQueue })`.
+  `createApp({ logger, whatsappVerifyToken, whatsappAppSecret, conversationService, incomingMessageQueue })`.
   `worker.ts` is the worker composition root: it constructs the logger, Prisma
   client, Redis connection, `ConversationService`,
   `createAiProvider(env.ai, new PromptBuilder())`, and `AiResponseService`, then
@@ -105,13 +105,15 @@ required column to a table that may have rows.
 
 ## Current implementation (Phase 5: outbound messaging)
 
-- Implemented: GET verification, POST validation, saving each supported text
+- Implemented: GET verification, raw-body POST signature verification, validation, saving each supported text
   message (with its user and conversation) in PostgreSQL, enqueueing it to
   BullMQ queue `incoming-messages`, and a separate worker that generates an AI
   reply through Azure AI Foundry, saves it as `OUTBOUND` / `PENDING`, then publishes
   to `outgoing-messages`. A dedicated WhatsApp worker sends and records acceptance.
-  Not implemented: caching, status-webhook processing, signature verification,
-  transactional outbox, or exactly-once delivery. Do not interpret the target flow
+  A pending-intent relay recovers missed outbound publications. Sender claims
+  serialize and pace recipients across replicas; UNKNOWN prevents blind resends.
+  Not implemented: caching, status-webhook processing, automatic acceptance
+  reconciliation, or exactly-once delivery. Do not interpret the target flow
   below as implemented behavior.
 - `WebhookController` owns GET verification and POST handling.
   `parseWebhookPayload(unknown)` validates the complete batch before logging or
@@ -148,17 +150,25 @@ required column to a table that may have rows.
   most 20 user/assistant messages, ending with the current message. A unique
   `replyToMessageId` reuses a saved reply on incoming retries; publishing uses
   its outbound database ID as the job ID. Never call WhatsApp from the AI worker.
-- `MessageStatus` is `PENDING`, `SENT`, or `FAILED` for outbound rows, NULL for
+- `MessageStatus` is `PENDING`, `SENT`, `FAILED`, or `UNKNOWN` for outbound rows, NULL for
   inbound rows. `SENT` means Meta API acceptance, not delivery/read. Store Meta's
-  receipt in `whatsappMessageId` and never downgrade a recorded `SENT` on failure.
+  receipt in `whatsappMessageId` and never downgrade `SENT` or `UNKNOWN` on failure.
   Old Phase 4 replies are backfilled but not automatically dispatched.
+- Only authenticated incoming jobs (`webhookVerified: true`) may generate AI work.
+  Save `dispatchCorrelationId` with the reply, never retrofit it onto a legacy
+  response. The sender relay scans 100 pending intents per pass every 10 seconds.
+  Delivery claims validate the durable recipient/content, use a per-user advisory
+  lock and database clock, enforce saved-outbound order and six-second spacing,
+  and reserve UNKNOWN before HTTP. Deferred jobs do not consume failed attempts.
 - `IWhatsAppProvider.sendTextMessage()` returns `{ providerResponseId }` rather
   than void so callers can persist/log the receipt. The Cloud API adapter uses
   Graph v26.0, a 10 s timeout, no HTTP retries, and sanitized typed errors.
-  Transient failures retry via BullMQ; permanent errors use `UnrecoverableError`.
+  Definite transient rejections retry via BullMQ; permanent errors use `UnrecoverableError`.
   Await terminal FAILED persistence inside the processor, not in event listeners.
-  A lost acceptance or failed status write can still cause duplicates or leave
-  PENDING rows; no automatic reconciliation exists yet.
+  Ambiguous transport outcomes, missing receipts, crashes after claiming, or failed
+  acceptance writes stay UNKNOWN, blocking newer replies to that user. Recovery
+  uses `whatsapp:reconcile` after every sender is stopped and the acceptance
+  decision is confirmed. Never infer rejection from a missing acknowledgement.
 - `AI_PROVIDER` selects `azure-foundry` (default) or the `openai` and `gemini`
   placeholders, which reject with `Not implemented`. Azure uses the `openai`
   SDK's `OpenAI` class with an HTTPS `/openai/v1/` endpoint; `AZURE_AI_MODEL` is
@@ -182,10 +192,13 @@ required column to a table that may have rows.
   and `messageId`; services log only after the transaction commits.
 - Never log raw request bodies, verification queries, headers, or message text;
   worker logs redact `messageText`. HTTP logs omit query strings and headers.
-- POSTs are not yet signature-authenticated. Default to local examples; the
+- POSTs require `WHATSAPP_APP_SECRET` and a valid HMAC-SHA256 of the original
+  uncompressed bytes, checked in constant time before persistence/enqueue.
+  `loadReconciliationEnv()` reads database/Redis/log configuration without
+  requiring model or sending credentials. Default to signed local examples; the
   README's temporary tunnel walkthrough is only for isolated, synthetic
-  dashboard tests. Real customer traffic or production deployment requires HTTPS and Meta
-  signature verification. Keep the WhatsApp worker stopped for synthetic local
+  dashboard tests. Real customer traffic or production deployment requires HTTPS
+  and operational safeguards. Keep the WhatsApp worker stopped for synthetic local
   or dashboard examples: starting it sends any queued outgoing jobs. Do not
   send live messages, open a tunnel, or change external accounts
   automatically when the user asks for setup instructions.

@@ -20,7 +20,7 @@ AI Worker          -> PostgreSQL: save OUTBOUND / PENDING
 Outgoing Queue     (outgoing-messages)
       |
       V
-WhatsApp Worker    -> PostgreSQL: record SENT or FAILED
+WhatsApp Worker    -> PostgreSQL: reserve UNKNOWN, then record SENT or FAILED
       |
       V
 WhatsApp Cloud API
@@ -114,28 +114,50 @@ update can instead perform separate lookup/insert operations that race and fail
 with `P2002`. The integration test holds inserts until four concurrent saves
 overlap, then verifies that every caller receives the same reply.
 
-A saved `SENT` or `FAILED` reply is not automatically
+A saved `SENT`, `FAILED`, or `UNKNOWN` reply is not automatically
 requeued by an incoming-job replay. Failed deliveries must be investigated
 separately instead of being silently resent.
+
+The reply also stores `dispatch_correlation_id` in that same atomic write.
+This is **dispatch intent**: evidence that authenticated work was authorized for
+publication, plus the correlation context needed after a restart. The sender's
+`OutgoingDispatchRelay` scans at most 100 pending intents per pass, every ten
+seconds, using an ID cursor. It republishes with the saved message ID and resets
+the cursor after reaching the end. Failed publication does not advance past the
+failed row. A new process can recover a reply even if the AI producer crashed
+immediately after the database commit, without another incoming job or AI call.
+
+This is a pending-row reconciler rather than a separate outbox table. Repeated
+publication is harmless while the stable BullMQ job exists; the durable send
+claim protects the HTTP boundary if a job is later recreated. The relay starts
+with the WhatsApp process after Redis becomes ready and stops before its
+connections close. Recovery therefore requires that process to be running.
 
 ## 4. Message state and migration
 
 The additive migration introduces the `message_status` enum and the reply link:
 
-| Outbound state | Meaning                                                               |
-| -------------- | --------------------------------------------------------------------- |
-| `PENDING`      | Saved, but no acceptance has been recorded; may be queued or retrying |
-| `SENT`         | Meta accepted the API call and its message ID was saved               |
-| `FAILED`       | Sending stopped after a permanent error or exhausted attempts         |
+| Outbound state | Meaning                                                                                  |
+| -------------- | ---------------------------------------------------------------------------------------- |
+| `PENDING`      | Saved, but no acceptance has been recorded; may be queued or retrying                    |
+| `SENT`         | Meta accepted the API call and its message ID was saved                                  |
+| `FAILED`       | Sending stopped after a permanent error or exhausted attempts                            |
+| `UNKNOWN`      | An attempt was reserved, but acceptance is not durably known; never automatically resend |
 
 Inbound rows have `status = NULL`: they do not have an outbound delivery state.
 The migration backfills old unsent Phase 4 replies to `PENDING`, without
 inventing a reply link or automatically publishing them. Existing outbound rows
 with a Meta ID become `SENT`. No messages are deleted.
 
+The follow-up `delivery_recovery` migration adds `UNKNOWN`, the nullable dispatch
+marker, a partial index for pending intents, and the user's next permitted send
+time. It deliberately does not backfill dispatch intent. Old unsigned incoming
+jobs are refused before AI generation, and legacy replies cannot pass the send
+claim. Replaying a signed request does not retroactively authorize an old reply.
+
 On acceptance, the repository updates `status` and `whatsapp_message_id` in one
 database operation. A replay of a `SENT` row skips the HTTP call. A late failure
-cannot downgrade an already-recorded `SENT` state.
+cannot downgrade an already-recorded `SENT` or uncertain `UNKNOWN` state.
 
 **Accepted is not delivered.** This phase does not process Meta's later
 `delivered`, `read`, or `failed` status webhooks. A `SENT` row is not evidence
@@ -145,9 +167,14 @@ also remains unchanged.
 ## 5. Retry policy and safe diagnostics
 
 Outgoing jobs have `attempts: 3` and exponential backoff starting at 1000 ms
-(about 1 second, then 2 seconds). The worker retries network/timeouts, HTTP
-408/429/5xx, Meta's `is_transient` flag, and documented temporary/rate-limit
+(about 1 second, then 2 seconds, subject to recipient pacing). Only definite
+API rejections are automatically retried: HTTP 408/429/5xx, Meta's `is_transient`
+flag, and documented temporary/rate-limit
 codes: `1`, `2`, `4`, `80007`, `130429`, `131000`, `131016`, `131056`.
+
+Network failures/timeouts and unreadable or receipt-less successful responses
+are ambiguous: the request may already have been accepted. They retain `UNKNOWN`,
+stop BullMQ retries, and require the recovery procedure below.
 
 Other API rejections, such as an expired token or a closed customer-service
 window, are permanent for this job. The worker persists `FAILED` and throws
@@ -169,13 +196,21 @@ retention policy before production use.
 
 ## 6. Run safely
 
-**POST signature verification is still missing. Do not expose this version to
-real customer traffic or production.** An unauthenticated webhook could otherwise
-trigger model usage and real sends. Existing local curl/dashboard examples use
-synthetic senders; leave the WhatsApp worker stopped while running those examples.
+POST requests require `X-Hub-Signature-256`, checked against an HMAC-SHA256 of the
+original request bytes using Node's constant-time comparison. The API requires
+`WHATSAPP_APP_SECRET`; there is no unsigned-mode bypass. Authentication runs
+before persistence/enqueue, and compressed bodies are rejected rather than
+verifying a decompressed representation. GET verification remains separate.
+
+Use the signed PowerShell example in the README. Older chapters describe the
+earlier unsigned API and need this signature when used with current code.
+Leave the WhatsApp worker stopped for synthetic local/dashboard examples.
 No tests in this repository send live WhatsApp messages.
 
-Stop API/AI processes before applying the migration, then:
+**Upgrade all processes together:** stop every API, AI worker, and WhatsApp
+worker before migrating. Do not mix the old sender with the new `UNKNOWN` state
+machine. Configure `WHATSAPP_APP_SECRET` with the Meta app secret (not the GET
+verification token), then:
 
 ```powershell
 docker compose up -d --wait
@@ -230,34 +265,65 @@ docker compose exec -T postgres psql -U litebot -d litebot -P pager=off -c "SELE
 ```
 
 Use the database named by your own `DATABASE_URL` if it is not the Compose
-database. `PENDING` with no outgoing job may indicate a publication failure.
-`FAILED` requires checking the safe error codes, credentials, recipient, and
-service window before deliberately retrying that existing outgoing job. A
-manual BullMQ retry is a new operator decision and can send another message.
+database. `PENDING` with dispatch intent but no job is rediscovered by the relay;
+check that the sender and its database/Redis connections are available.
+`FAILED` is terminal: investigate safe error codes, credentials, recipient, and
+service window. A BullMQ retry alone does not reset a terminal database state.
 
-## 7. Reliability limits
+## 7. Ordering, uncertain acceptance, and recovery
 
-This is **at-least-once**, not exactly-once delivery:
+The sender takes a PostgreSQL transaction-level advisory lock per user. Under
+that lock it verifies the saved recipient/content/dispatch intent, checks the
+oldest unsettled reply, advances `next_whatsapp_send_at`, and commits `UNKNOWN`
+**before** calling Meta. No network request holds a database transaction open.
 
-- PostgreSQL save and Redis publication are not one transaction. If publication
-  exhausts incoming retries, the saved reply can remain `PENDING` without a job.
-  Recovery uses the same reply ID, but there is no automatic outbox relay yet.
-- If Meta accepts a message but the HTTP response is lost, or the database cannot
-  record acceptance, a retry can send a duplicate. A `SENT` guard cannot protect
-  an acknowledgement we never recorded. When the receipt is known but its save
-  fails, `WhatsApp acceptance could not be persisted` logs its ID for investigation.
-- If the final status write itself fails, the worker logs
-  `Outgoing message FAILED status could not be persisted` and fails the queue job;
-  PostgreSQL may remain `PENDING`. A worker crash or terminal stalled job can
-  also leave state unreconciled. A durable reconciliation process is future work.
-- Separate workers/replicas can reorder replies. There is no per-recipient
-  ordering, adaptive rate limiter, or long-term retry scheduler yet.
-- History still consists of stored messages, including pending/failed assistant
-  replies; it is not a delivered-only transcript.
+The enforced order is **saved outbound creation order** (`createdAt`, then ID),
+not inbound arrival order or parallel AI generation order. An older `PENDING`
+retry or `UNKNOWN` attempt blocks newer replies to that user, across conversations
+and replicas. Other recipients can continue. Claims are at least six seconds
+apart per recipient, using the database clock and persisted cooldown. Each worker
+currently has concurrency one; adding replicas cannot bypass the recipient gate.
+Deferrals move the BullMQ job to delayed without using a failed attempt.
 
-An eventual transactional outbox, receipt reconciliation, per-recipient ordering,
-and authenticated webhooks are separate reliability/security stages. This phase
-does not add caching, RAG, embeddings, business workflows, or automatic scaling.
+`UNKNOWN` deliberately includes a crash after claiming but before HTTP. We cannot
+prove whether a crashed process crossed the external boundary, so automatic
+availability is sacrificed rather than risking a duplicate. A failed acceptance
+write logs the known `providerResponseId` for investigation. Neither incoming
+replay, outgoing retry, nor the relay automatically resends uncertain work.
+
+### Explicit operator reconciliation
+
+Stop **all** WhatsApp workers first, including replicas. The flag below records
+your acknowledgement; it does not remotely stop or detect other processes.
+Investigate the provider's records or a trustworthy acceptance receipt. Do not
+guess `not-sent` merely because no response was logged.
+
+```powershell
+# Confirmed accepted: record the actual provider receipt; never sends HTTP.
+npm run whatsapp:reconcile -- MESSAGE_UUID sent PROVIDER_RECEIPT --workers-stopped
+
+# Confirmed NOT accepted: permit a fresh attempt.
+npm run whatsapp:reconcile -- MESSAGE_UUID not-sent --workers-stopped
+```
+
+Only an authenticated dispatch currently in `UNKNOWN` can be reconciled.
+`sent` records `SENT` and its receipt. `not-sent` first removes the old failed
+BullMQ job, then changes the database state to `PENDING`; a non-failed queue job
+is refused. If the command crashes before the database update, the row remains
+`UNKNOWN`. If it crashes afterwards, the relay recovers it on sender restart.
+The command needs database/Redis configuration, not AI or Meta credentials, and
+does not start a sending worker. Resume senders only after the decision succeeds.
+
+This is not exactly-once delivery or automatic receipt reconciliation. If no
+trustworthy acceptance decision is available, leave the reply `UNKNOWN`.
+Provider-wide quotas, distributed clock operations, monitoring, and delivery/read
+status webhooks still need production design. A failed terminal status write can
+leave a `PENDING` row with a failed job; that requires investigation rather than
+automatic reactivation of a terminal failure. History includes stored pending,
+failed, and uncertain replies, not only delivered messages.
+
+This phase does not add caching, RAG, embeddings, business workflows, or
+automatic scaling.
 
 ## 8. Verification and references
 
@@ -269,6 +335,12 @@ AI and fake Meta HTTP responses. They exercise the webhook -> AI -> outgoing
 queue -> WhatsApp worker -> receipt path, transient recovery, exhausted retries,
 permanent rejection, and migration over existing rows. They do not prove that
 your live credentials or Meta account are configured correctly.
+
+Recovery coverage includes a fresh relay after save-then-crash, concurrent
+recipient claims, retry ordering and shared pacing, acceptance followed by a
+lost response, refusal to resend UNKNOWN work, and explicit operator recovery.
+Run queue tests that execute `SCRIPT FLUSH` only against a separate test Redis,
+never a shared live Redis; all other fixtures use private queue prefixes.
 
 - [Meta text messages](https://developers.facebook.com/documentation/business-messaging/whatsapp/messages/text-messages)
 - [Meta error codes](https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes)

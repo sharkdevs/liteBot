@@ -118,3 +118,7 @@ Terms are added here as chapters introduce them.
 | `UnrecoverableError`         | BullMQ's way to stop automatic retries for a permanently failing job.                                                                                               |
 | Reply link                   | A unique `reply_to_message_id` associating a saved AI reply with the inbound message that caused it.                                                                |
 | Reconciliation               | Comparing external, queue, and database state after failures to find and repair inconsistencies.                                                                    |
+| Webhook signature            | An HMAC-SHA256 of the original request bytes, verified with the Meta app secret before accepting a POST.                                                            |
+| Dispatch intent              | Durable authorization to publish a reply, saved with the response so a relay can recover after a crash.                                                             |
+| Unknown acceptance           | A reserved send whose provider outcome is uncertain; automatic resend is blocked until an operator reconciles it.                                                   |
+| Recipient pacing             | A database-enforced minimum interval between send attempts to one user, shared by every sender replica.                                                             |
