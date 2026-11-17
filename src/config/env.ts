@@ -26,6 +26,10 @@ interface RuntimeEnv {
   readonly redis: RedisSettings;
 }
 
+export interface ReconciliationEnv extends RuntimeEnv {
+  readonly databaseUrl: string;
+}
+
 export interface WorkerEnv extends RuntimeEnv {
   readonly databaseUrl: string;
   readonly ai: AiSettings;
@@ -44,6 +48,7 @@ export interface WhatsAppWorkerEnv extends RuntimeEnv {
 export interface Env extends RuntimeEnv {
   readonly port: number;
   readonly whatsappVerifyToken: string;
+  readonly whatsappAppSecret: string;
   readonly databaseUrl: string;
 }
 
@@ -66,6 +71,13 @@ function parseLogLevel(value: string | undefined): LogLevel {
 function parseVerifyToken(value: string | undefined): string {
   if (!value || value.trim().length === 0) {
     throw new Error('WHATSAPP_VERIFY_TOKEN must be configured with a non-empty value');
+  }
+  return value;
+}
+
+function parseAppSecret(value: string | undefined): string {
+  if (!value?.trim()) {
+    throw new Error('WHATSAPP_APP_SECRET must be configured with a non-empty value');
   }
   return value;
 }
@@ -159,10 +171,18 @@ export function loadWorkerEnv(source: NodeJS.ProcessEnv = process.env): WorkerEn
   });
 }
 
+export function loadReconciliationEnv(source: NodeJS.ProcessEnv = process.env): ReconciliationEnv {
+  return Object.freeze({
+    ...loadRuntimeEnv(source),
+    databaseUrl: parseDatabaseUrl(source.DATABASE_URL),
+  });
+}
+
 export function loadApiEnv(source: NodeJS.ProcessEnv = process.env): Env {
   return Object.freeze({
     port: parsePort(source.PORT, 'PORT', 3000),
     whatsappVerifyToken: parseVerifyToken(source.WHATSAPP_VERIFY_TOKEN),
+    whatsappAppSecret: parseAppSecret(source.WHATSAPP_APP_SECRET),
     ...loadRuntimeEnv(source),
     databaseUrl: parseDatabaseUrl(source.DATABASE_URL),
   });

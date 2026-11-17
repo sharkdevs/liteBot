@@ -11,6 +11,7 @@ import type { OutgoingMessageJob } from '../src/shared/types/outgoing-message-jo
 import { AiResponseService } from '../src/services/ai-response.service.js';
 
 const job: IncomingMessageJob = {
+  webhookVerified: true,
   correlationId: 'ai-response-correlation',
   messageId: 'inbound-message-id',
   userId: 'user-id',
@@ -162,8 +163,9 @@ await test('publication failure retries the saved reply without another AI call 
     recordInboundMessage: () => Promise.reject(new Error('Unexpected inbound write')),
     getRecentMessages: () => Promise.resolve([]),
     findReplyToMessage: () => Promise.resolve(saved),
-    saveOutboundMessage: (conversationId, content, replyToMessageId) => {
+    saveOutboundMessage: (conversationId, content, replyToMessageId, dispatchCorrelationId) => {
       assert.equal(replyToMessageId, job.messageId);
+      assert.equal(dispatchCorrelationId, job.correlationId);
       assert.equal(saved, null);
       saved = {
         id: 'stable-reply-id',
@@ -201,6 +203,27 @@ await test('publication failure retries the saved reply without another AI call 
   await service.process(job);
   assert.equal(generations, 1);
   assert.equal(publications, 2);
+});
+
+await test('legacy unsigned jobs cannot generate or dispatch a reply', async () => {
+  const legacy = { ...job };
+  delete legacy.webhookVerified;
+  const unexpected = () => Promise.reject(new Error('Unsigned work crossed the guard'));
+  const service = new AiResponseService(
+    {
+      recordInboundMessage: unexpected,
+      findReplyToMessage: unexpected,
+      getRecentMessages: unexpected,
+      saveOutboundMessage: unexpected,
+    },
+    { generateResponse: unexpected },
+    'synthetic-model',
+    pino({ level: 'silent' }),
+    {
+      enqueue: unexpected,
+    },
+  );
+  await assert.rejects(service.process(legacy), /authenticated webhook provenance/);
 });
 
 await test('a failed outbound save prevents queue publication', async () => {

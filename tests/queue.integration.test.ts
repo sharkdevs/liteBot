@@ -6,10 +6,16 @@ import { WhatsAppProviderError } from '../src/providers/whatsapp/whatsapp-provid
 
 import type { IConversationService } from '../src/services/conversation.service.js';
 import type { IncomingMessageJob } from '../src/shared/types/incoming-message-job.js';
-import { setupQueue, startWebhook, textMessageWebhook } from './support/queue-fixture.js';
+import {
+  setupQueue,
+  signWebhook,
+  startWebhook,
+  textMessageWebhook,
+} from './support/queue-fixture.js';
 
 // IDs that a real database would have assigned; this file tests Redis, not PostgreSQL.
 const message: IncomingMessageJob = {
+  webhookVerified: true,
   correlationId: 'queue-test-correlation',
   messageId: 'message-queue-test',
   userId: 'user-queue-test',
@@ -44,7 +50,11 @@ await test(
     const url = await startWebhook(t, fixture, savedMessage);
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-correlation-id': message.correlationId },
+      headers: {
+        'content-type': 'application/json',
+        'x-correlation-id': message.correlationId,
+        'x-hub-signature-256': signWebhook(webhookBody()),
+      },
       body: webhookBody(),
     });
     assert.equal(response.status, 200);
@@ -75,7 +85,10 @@ await test(
     fixture.connection.disconnect();
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': signWebhook(webhookBody()),
+      },
       body: webhookBody(),
       signal: AbortSignal.timeout(5000),
     });

@@ -18,6 +18,7 @@ const incomingMessageQueue = new IncomingMessageQueue(connection, logger);
 const app = createApp({
   logger,
   whatsappVerifyToken: env.whatsappVerifyToken,
+  whatsappAppSecret: env.whatsappAppSecret,
   conversationService: new ConversationService(new PrismaUnitOfWork(prisma), logger),
   incomingMessageQueue,
 });

@@ -64,4 +64,13 @@ export class OutgoingMessageQueue implements OutgoingMessageQueuePort {
   async close(): Promise<void> {
     await this.queue.close();
   }
+
+  async removeFailedForReconciliation(id: string): Promise<void> {
+    const job = await this.queue.getJob(id);
+    if (!job) return;
+    if ((await job.getState()) !== 'failed') {
+      throw new Error('Reconciliation requires a failed or absent job and stopped sending workers');
+    }
+    await job.remove();
+  }
 }

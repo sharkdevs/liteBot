@@ -14,6 +14,7 @@ export class WhatsAppProviderError extends Error {
     readonly retryable: boolean,
     readonly httpStatus?: number,
     readonly apiCode?: number,
+    readonly acceptanceUnknown = false,
   ) {
     super(message);
     this.name = 'WhatsAppProviderError';

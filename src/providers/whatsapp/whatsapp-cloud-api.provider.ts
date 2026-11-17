@@ -51,7 +51,13 @@ export class WhatsAppCloudApiProvider implements IWhatsAppProvider {
           },
         );
       } catch {
-        throw new WhatsAppProviderError('WhatsApp network request failed or timed out', true);
+        throw new WhatsAppProviderError(
+          'WhatsApp network request failed or timed out',
+          true,
+          undefined,
+          undefined,
+          true,
+        );
       }
 
       let payload: unknown;
@@ -66,6 +72,8 @@ export class WhatsAppCloudApiProvider implements IWhatsAppProvider {
             response.status === 429 ||
             response.status >= 500,
           response.status,
+          undefined,
+          response.ok,
         );
       }
       if (!response.ok) {
@@ -87,7 +95,13 @@ export class WhatsAppCloudApiProvider implements IWhatsAppProvider {
       const messages = isRecord(payload) && Array.isArray(payload.messages) ? payload.messages : [];
       const first: unknown = messages[0];
       if (!isRecord(first) || typeof first.id !== 'string' || !first.id.trim()) {
-        throw new WhatsAppProviderError('WhatsApp response is missing a message ID', true);
+        throw new WhatsAppProviderError(
+          'WhatsApp response is missing a message ID',
+          true,
+          response.status,
+          undefined,
+          true,
+        );
       }
       return { providerResponseId: first.id };
     } finally {

@@ -1,6 +1,7 @@
 import {
   Worker,
   UnrecoverableError,
+  DelayedError,
   type IRedisClient,
   type Job,
   type WorkerOptions,
@@ -13,7 +14,12 @@ import {
   OUTGOING_MESSAGE_QUEUE_NAME,
 } from '../queues/queue.constants.js';
 import type { WhatsAppDeliveryService } from '../services/whatsapp-delivery.service.js';
-import type { OutgoingMessageJob } from '../shared/types/outgoing-message-job.js';
+import {
+  DeferredDeliveryError,
+  UnknownAcceptanceError,
+  InvalidDispatchError,
+  type OutgoingMessageJob,
+} from '../shared/types/outgoing-message-job.js';
 
 type OutgoingJob = Job<OutgoingMessageJob, void, typeof OUTGOING_MESSAGE_JOB_NAME>;
 
@@ -30,15 +36,25 @@ export function createWhatsAppWorker(
 ): Worker<OutgoingMessageJob, void, typeof OUTGOING_MESSAGE_JOB_NAME> {
   const worker = new Worker<OutgoingMessageJob, void, typeof OUTGOING_MESSAGE_JOB_NAME>(
     OUTGOING_MESSAGE_QUEUE_NAME,
-    async (job) => {
+    async (job, token) => {
       const attempt = job.attemptsMade + 1;
       const context = { ...logContext(job), attempt };
       logger.info(context, 'Outgoing message processing started');
       try {
         await delivery.send(job.data);
       } catch (error) {
+        if (error instanceof DeferredDeliveryError) {
+          await job.moveToDelayed(error.until.getTime(), token);
+          logger.info(context, 'Outgoing message deferred for recipient ordering or pacing');
+          throw new DelayedError();
+        }
+        if (error instanceof UnknownAcceptanceError) {
+          logger.error(context, 'Outgoing acceptance unknown; operator reconciliation required');
+          throw new UnrecoverableError(error.message);
+        }
         const providerError = error instanceof WhatsAppProviderError ? error : undefined;
-        const permanent = providerError?.retryable === false;
+        const permanent =
+          error instanceof InvalidDispatchError || providerError?.retryable === false;
         const terminal = permanent || attempt >= (job.opts.attempts ?? 1);
         logger.error(
           {

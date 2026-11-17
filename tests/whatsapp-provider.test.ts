@@ -92,6 +92,7 @@ await test('Cloud API classifies transient and permanent errors without leaking 
       (error: unknown) => {
         assert.ok(error instanceof WhatsAppProviderError);
         assert.equal(error.retryable, transient);
+        assert.equal(error.acceptanceUnknown, false);
         assert.equal(error.httpStatus, status);
         assert.equal(error.apiCode, code);
         assert.doesNotMatch(inspect(error), /PRIVATE_ERROR_BODY|PRIVATE_TOKEN|Private reply/);
@@ -114,6 +115,7 @@ await test('Cloud API rejects malformed acceptance responses and non-JSON failur
       provider.sendTextMessage('15550000001', 'Private reply'),
       (error: unknown) => {
         assert.ok(error instanceof WhatsAppProviderError);
+        assert.equal(error.acceptanceUnknown, response.ok);
         assert.doesNotMatch(inspect(error), /PRIVATE_/);
         return true;
       },
@@ -134,6 +136,7 @@ await test('Cloud API aborts a stalled request and sanitizes network errors', as
     (error: unknown) => {
       assert.ok(error instanceof WhatsAppProviderError);
       assert.equal(error.retryable, true);
+      assert.equal(error.acceptanceUnknown, true);
       assert.doesNotMatch(inspect(error), /PRIVATE_NETWORK_DETAILS/);
       return true;
     },

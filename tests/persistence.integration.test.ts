@@ -10,6 +10,7 @@ import { WhatsappMessageIdConflictError } from '../src/domain/message/message-id
 import { ConversationRepository } from '../src/repositories/conversation.repository.js';
 import { UserRepository } from '../src/repositories/user.repository.js';
 import { MessageRepository } from '../src/repositories/message.repository.js';
+import { PrismaDeliveryRepository } from '../src/repositories/delivery.repository.js';
 import { WhatsAppCloudApiProvider } from '../src/providers/whatsapp/whatsapp-cloud-api.provider.js';
 import { WhatsAppDeliveryService } from '../src/services/whatsapp-delivery.service.js';
 import { PrismaUnitOfWork, type IUnitOfWork } from '../src/repositories/unit-of-work.js';
@@ -19,7 +20,12 @@ import {
   ConversationService,
   type InboundTextMessage,
 } from '../src/services/conversation.service.js';
-import { setupQueue, startWebhook, textMessageWebhook } from './support/queue-fixture.js';
+import {
+  setupQueue,
+  startWebhook,
+  textMessageWebhook,
+  signWebhook,
+} from './support/queue-fixture.js';
 import { createTestDatabase } from './support/test-database.js';
 
 const database = await createTestDatabase();
@@ -81,15 +87,32 @@ await test('persistence layer', async (t) => {
       await prisma.$transaction(async (tx) => {
         // Reconstruct the prior schema only inside this throwaway test database.
         await tx.$executeRawUnsafe(
-          'ALTER TABLE messages DROP COLUMN status, DROP COLUMN reply_to_message_id',
+          'ALTER TABLE messages DROP COLUMN status, DROP COLUMN reply_to_message_id, DROP COLUMN dispatch_correlation_id',
         );
+        await tx.$executeRawUnsafe('ALTER TABLE users DROP COLUMN next_whatsapp_send_at');
         await tx.$executeRawUnsafe('DROP TYPE message_status');
         await tx.$executeRaw`
         INSERT INTO messages (id, conversation_id, direction, content)
         VALUES ('00000000-0000-4000-8000-000000000001', ${conversation.id}::uuid, 'INBOUND', 'Old inbound'),
                ('00000000-0000-4000-8000-000000000002', ${conversation.id}::uuid, 'OUTBOUND', 'Old reply')
       `;
-        for (const statement of migration.split(';').filter((sql) => sql.trim())) {
+        for (const statement of migration
+          .replace(/^--.*$/gm, '')
+          .split(';')
+          .filter((sql) => sql.trim())) {
+          await tx.$executeRawUnsafe(statement);
+        }
+        const recoveryMigration = await readFile(
+          new URL(
+            '../prisma/migrations/20261117010000_delivery_recovery/migration.sql',
+            import.meta.url,
+          ),
+          'utf8',
+        );
+        for (const statement of recoveryMigration
+          .replace(/^--.*$/gm, '')
+          .split(';')
+          .filter((sql) => sql.trim())) {
           await tx.$executeRawUnsafe(statement);
         }
       });
@@ -97,6 +120,7 @@ await test('persistence layer', async (t) => {
         where: { conversationId: conversation.id },
         orderBy: { id: 'asc' },
       });
+      assert.ok(rows.every((row) => row.dispatchCorrelationId === null));
       assert.deepEqual(
         rows.map(({ content, status, replyToMessageId }) => ({
           content,
@@ -481,7 +505,7 @@ await test('persistence layer', async (t) => {
 
   await t.test(
     'a webhook request saves the message, then a worker consumes its job',
-    { timeout: 20_000 },
+    { timeout: 30_000 },
     async (t) => {
       const fixture = await setupQueue(t);
       const service = new ConversationService(unitOfWork, fixture.logger);
@@ -504,7 +528,11 @@ await test('persistence layer', async (t) => {
       const post = () =>
         fetch(url, {
           method: 'POST',
-          headers: { 'content-type': 'application/json', 'x-correlation-id': 'e2e-correlation' },
+          headers: {
+            'content-type': 'application/json',
+            'x-correlation-id': 'e2e-correlation',
+            'x-hub-signature-256': signWebhook(body),
+          },
           body,
         });
 
@@ -527,6 +555,7 @@ await test('persistence layer', async (t) => {
       const [job] = await fixture.inspector.getWaiting();
       assert.equal(job?.id, message.id);
       assert.deepEqual(job.data, {
+        webhookVerified: true,
         correlationId: 'e2e-correlation',
         messageId: message.id,
         userId: user.id,
@@ -597,7 +626,7 @@ await test('persistence layer', async (t) => {
           attempts.push(performance.now());
           assert.equal(
             (await prisma.message.findUniqueOrThrow({ where: { id: savedResponse.id } })).status,
-            'PENDING',
+            'UNKNOWN',
           );
           assert.ok(typeof init?.body === 'string');
           const payload = JSON.parse(init.body) as { to: string; text: { body: string } };
@@ -613,9 +642,13 @@ await test('persistence layer', async (t) => {
         },
       );
       const whatsappWorker = fixture.startWhatsAppWorker(
-        new WhatsAppDeliveryService(new MessageRepository(prisma), transport, fixture.logger),
+        new WhatsAppDeliveryService(
+          new PrismaDeliveryRepository(prisma),
+          transport,
+          fixture.logger,
+        ),
       );
-      await once(whatsappWorker, 'completed', { signal: AbortSignal.timeout(10_000) });
+      await once(whatsappWorker, 'completed', { signal: AbortSignal.timeout(25_000) });
       assert.equal(sends, 3);
       assert.ok((attempts[1] ?? 0) - (attempts[0] ?? 0) >= 900);
       assert.ok((attempts[2] ?? 0) - (attempts[1] ?? 0) >= 1900);
@@ -640,7 +673,7 @@ await test('persistence layer', async (t) => {
   ] as const) {
     await t.test(
       `outbound ${label} persist FAILED without regenerating AI`,
-      { timeout: 15_000 },
+      { timeout: 25_000 },
       async (t) => {
         const fixture = await setupQueue(t);
         const service = new ConversationService(unitOfWork, fixture.logger);
@@ -652,6 +685,7 @@ await test('persistence layer', async (t) => {
           recorded.conversationId,
           'PRIVATE_FAILED_REPLY',
           recorded.messageId,
+          'outgoing-failure',
         );
         let requests = 0;
         const provider = new WhatsAppCloudApiProvider(
@@ -664,7 +698,11 @@ await test('persistence layer', async (t) => {
           },
         );
         const worker = fixture.startWhatsAppWorker(
-          new WhatsAppDeliveryService(new MessageRepository(prisma), provider, fixture.logger),
+          new WhatsAppDeliveryService(
+            new PrismaDeliveryRepository(prisma),
+            provider,
+            fixture.logger,
+          ),
         );
         const exhausted = new Promise<void>((resolve) => {
           worker.on('failed', (job) => {

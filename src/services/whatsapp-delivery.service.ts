@@ -4,12 +4,16 @@ import {
   WhatsAppProviderError,
   type IWhatsAppProvider,
 } from '../providers/whatsapp/whatsapp-provider.js';
-import type { IMessageRepository } from '../repositories/message.repository.js';
-import type { OutgoingMessageJob } from '../shared/types/outgoing-message-job.js';
+import type { DeliveryRepository } from '../repositories/delivery.repository.js';
+import {
+  DeferredDeliveryError,
+  UnknownAcceptanceError,
+  type OutgoingMessageJob,
+} from '../shared/types/outgoing-message-job.js';
 
 export class WhatsAppDeliveryService {
   constructor(
-    private readonly messages: Pick<IMessageRepository, 'findById' | 'markSent' | 'markFailed'>,
+    private readonly messages: DeliveryRepository,
     private readonly provider: IWhatsAppProvider,
     private readonly logger: Logger,
   ) {}
@@ -36,7 +40,24 @@ export class WhatsAppDeliveryService {
       );
       return;
     }
-    const { providerResponseId } = await this.provider.sendTextMessage(phoneNumber, saved.content);
+    const claim = await this.messages.claim(job);
+    if (claim.state === 'sent') return;
+    if (claim.state === 'unknown') throw new UnknownAcceptanceError();
+    if (claim.state === 'deferred') throw new DeferredDeliveryError(claim.until);
+    let providerResponseId: string;
+    try {
+      ({ providerResponseId } = await this.provider.sendTextMessage(phoneNumber, saved.content));
+    } catch (error) {
+      if (error instanceof WhatsAppProviderError && !error.acceptanceUnknown) {
+        try {
+          await this.messages.markPending(messageId);
+        } catch {
+          throw new UnknownAcceptanceError();
+        }
+        throw error;
+      }
+      throw new UnknownAcceptanceError();
+    }
     try {
       await this.messages.markSent(messageId, providerResponseId);
     } catch {
@@ -44,7 +65,7 @@ export class WhatsAppDeliveryService {
         { ...context, providerResponseId },
         'WhatsApp acceptance could not be persisted',
       );
-      throw new Error('WhatsApp acceptance could not be persisted');
+      throw new UnknownAcceptanceError();
     }
     this.logger.info({ ...context, providerResponseId }, 'WhatsApp message sent');
   }

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { Writable } from 'node:stream';
 import type { TestContext } from 'node:test';
@@ -21,6 +21,12 @@ import type { IncomingMessageJob } from '../../src/shared/types/incoming-message
 import { createMessageWorker, type MessageProcessor } from '../../src/workers/message.worker.js';
 import { createWhatsAppWorker } from '../../src/workers/whatsapp.worker.js';
 import type { WhatsAppDeliveryService } from '../../src/services/whatsapp-delivery.service.js';
+
+export const webhookAppSecret = 'synthetic-whatsapp-app-secret';
+
+export function signWebhook(body: string): string {
+  return `sha256=${createHmac('sha256', webhookAppSecret).update(body).digest('hex')}`;
+}
 
 /** A queue under a unique Redis key prefix, removed after the test, plus captured logs. */
 export async function setupQueue(t: TestContext) {
@@ -127,6 +133,7 @@ export async function startWebhook(
   const server = createApp({
     logger: fixture.logger,
     whatsappVerifyToken: 'integration-verification-token',
+    whatsappAppSecret: webhookAppSecret,
     conversationService,
     incomingMessageQueue: fixture.queue,
   }).listen(0, '127.0.0.1');

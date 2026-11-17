@@ -47,6 +47,8 @@ await test('acceptance persists SENT before success logging, and repeated delive
   const service = new WhatsAppDeliveryService(
     {
       findById: () => Promise.resolve(saved),
+      claim: () => Promise.resolve({ state: 'claimed' as const }),
+      markPending: () => Promise.resolve(),
       markSent: (_id, receipt) => {
         saved = { ...saved, status: 'SENT', whatsappMessageId: receipt };
         return Promise.resolve();
@@ -77,6 +79,8 @@ await test('transient transport failure does not mark SENT or FAILED before the 
   const service = new WhatsAppDeliveryService(
     {
       findById: () => Promise.resolve(saved),
+      claim: () => Promise.resolve({ state: 'claimed' as const }),
+      markPending: () => Promise.resolve(),
       markSent: () => Promise.reject(new Error('Unexpected acceptance')),
       markFailed: () => Promise.reject(new Error('Unexpected terminal update')),
     },
@@ -98,6 +102,8 @@ await test('missing or inconsistent persisted outbound rows are never sent', asy
     const service = new WhatsAppDeliveryService(
       {
         findById: () => Promise.resolve(saved),
+        claim: () => Promise.resolve({ state: 'claimed' as const }),
+        markPending: () => Promise.resolve(),
         markSent: () => Promise.reject(new Error('Unexpected acceptance')),
         markFailed: () => Promise.reject(new Error('Unexpected terminal update')),
       },
@@ -126,6 +132,8 @@ await test('acceptance persistence failure records the receipt for investigation
   const service = new WhatsAppDeliveryService(
     {
       findById: () => Promise.resolve(message()),
+      claim: () => Promise.resolve({ state: 'claimed' as const }),
+      markPending: () => Promise.resolve(),
       markSent: () => Promise.reject(new Error('PRIVATE_DATABASE_FAILURE')),
       markFailed: () => Promise.resolve(),
     },
@@ -134,7 +142,7 @@ await test('acceptance persistence failure records the receipt for investigation
     },
     logger,
   );
-  await assert.rejects(service.send(job), /acceptance could not be persisted/);
+  await assert.rejects(service.send(job), /acceptance is unknown/);
   assert.match(logs.join(''), /"providerResponseId":"wamid.unrecorded-receipt"/);
   assert.doesNotMatch(logs.join(''), /WhatsApp message sent|PRIVATE_DATABASE_FAILURE/);
 });

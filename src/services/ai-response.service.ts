@@ -15,6 +15,9 @@ export class AiResponseService {
   ) {}
 
   async process(job: IncomingMessageJob): Promise<void> {
+    if (job.webhookVerified !== true) {
+      throw new Error('Refusing work without authenticated webhook provenance');
+    }
     const existing = await this.conversationService.findReplyToMessage(job.messageId);
     if (existing) {
       if (existing.status === 'PENDING') {
@@ -57,6 +60,7 @@ export class AiResponseService {
       job.conversationId,
       response,
       job.messageId,
+      job.correlationId,
     );
     await this.outgoingQueue.enqueue({
       phoneNumber: job.phoneNumber,

@@ -13,6 +13,7 @@ import type { IncomingMessageQueuePort } from './shared/types/incoming-message-j
 interface AppDependencies {
   logger: Logger;
   whatsappVerifyToken: string;
+  whatsappAppSecret: string;
   conversationService: IConversationService;
   incomingMessageQueue: IncomingMessageQueuePort;
 }
@@ -20,6 +21,7 @@ interface AppDependencies {
 export function createApp({
   logger,
   whatsappVerifyToken,
+  whatsappAppSecret,
   conversationService,
   incomingMessageQueue,
 }: AppDependencies): Express {
@@ -38,18 +40,16 @@ export function createApp({
       },
     }),
   );
-  app.use(express.json());
-
   app.use(healthRouter);
   app.use(
     '/webhook',
     createWebhookRouter(
       new WebhookController(whatsappVerifyToken, logger, conversationService, incomingMessageQueue),
+      whatsappAppSecret,
     ),
   );
   app.use(createErrorMiddleware(logger));
 
-  // TODO(later stages): authenticate webhook deliveries before enabling real traffic.
   // TODO(later stages): enable `cors` with an explicit origin allow-list once a browser client exists.
 
   return app;

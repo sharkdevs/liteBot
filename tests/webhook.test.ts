@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { once } from 'node:events';
 import { Writable } from 'node:stream';
 import { test, type TestContext } from 'node:test';
 import { promisify } from 'node:util';
+import { gzipSync } from 'node:zlib';
 import { pino } from 'pino';
 
 import { createApp } from '../src/app.js';
@@ -14,12 +16,35 @@ import type {
   IncomingMessageJob,
   IncomingMessageQueuePort,
 } from '../src/shared/types/incoming-message-job.js';
+import { signWebhook, webhookAppSecret } from './support/queue-fixture.js';
 
 const verifyToken = 'test-webhook-verification-token';
 
 interface AppOverrides {
   queue?: IncomingMessageQueuePort;
   conversationService?: IConversationService;
+}
+
+for (const whatsappAppSecret of ['', ' \t ']) {
+  await test('createApp refuses a blank WhatsApp app secret', () => {
+    assert.throws(
+      () =>
+        createApp({
+          logger: pino({ level: 'silent' }),
+          whatsappVerifyToken: verifyToken,
+          whatsappAppSecret,
+          conversationService: {
+            recordInboundMessage: () => Promise.reject(new Error('Must not save data')),
+            getRecentMessages: () => Promise.resolve([]),
+            saveOutboundMessage: () => Promise.reject(new Error('Must not save data')),
+          },
+          incomingMessageQueue: {
+            enqueue: () => Promise.reject(new Error('Must not enqueue jobs')),
+          },
+        }),
+      /WHATSAPP_APP_SECRET must be configured with a non-empty value/,
+    );
+  });
 }
 
 async function startApp(t: TestContext, overrides: AppOverrides = {}) {
@@ -59,6 +84,7 @@ async function startApp(t: TestContext, overrides: AppOverrides = {}) {
   const server = createApp({
     logger,
     whatsappVerifyToken: verifyToken,
+    whatsappAppSecret: webhookAppSecret,
     conversationService,
     incomingMessageQueue,
   }).listen(0, '127.0.0.1');
@@ -131,6 +157,137 @@ function payloadWith(value: unknown) {
   };
 }
 
+function signedWebhookRequest(url: string, options: RequestInit & { body: string }) {
+  const headers = new Headers(options.headers);
+  headers.set('x-hub-signature-256', signWebhook(options.body));
+  return fetch(url, { ...options, headers });
+}
+
+for (const signature of [
+  undefined,
+  '',
+  `sha256=${'a'.repeat(63)}`,
+  `sha256=${'a'.repeat(65)}`,
+  `sha256=${'z'.repeat(64)}`,
+  `sha1=${'a'.repeat(64)}`,
+  `SHA256=${'a'.repeat(64)}`,
+  `${signWebhook('{}')}, ${signWebhook('{}')}`,
+  signWebhook('{}'),
+]) {
+  await test(`POST rejects an invalid signature before saving or queueing: ${String(signature)}`, async (t) => {
+    const { url, jobs, recorded, calls, logs } = await startApp(t);
+    const body = JSON.stringify({
+      ...payloadWith({ messages: [textMessage()] }),
+      webhookVerified: true,
+    });
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'x-correlation-id': 'signature-rejection',
+    };
+    if (signature !== undefined) {
+      headers['x-hub-signature-256'] = signature;
+    }
+    const response = await fetch(url, { method: 'POST', headers, body });
+
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: 'Forbidden' });
+    assert.equal(response.headers.get('x-correlation-id'), 'signature-rejection');
+    assert.deepEqual(recorded, []);
+    assert.deepEqual(jobs, []);
+    assert.deepEqual(calls, []);
+    assert.doesNotMatch(logs.join(''), /PRIVATE_QUEUED_TEXT|WhatsApp webhook payload received/);
+    assert.ok(!logs.join('').includes(webhookAppSecret));
+    if (signature) {
+      assert.ok(!logs.join('').includes(signature));
+    }
+  });
+}
+
+await test('POST authenticates the original UTF-8 bytes before parsing JSON', async (t) => {
+  const { url, recorded, jobs, logs } = await startApp(t);
+  const content = 'PRIVATE_UNICODE_TEXT Привет 🌍';
+  const body = JSON.stringify(
+    payloadWith({ messages: [{ ...textMessage(), text: { body: content } }] }),
+    null,
+    2,
+  );
+  const signature = signWebhook(body);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-Hub-Signature-256': signature },
+    body,
+  });
+
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(recorded[0]?.content, content);
+  assert.equal(jobs[0]?.webhookVerified, true);
+  assert.doesNotMatch(logs.join(''), /PRIVATE_UNICODE_TEXT/);
+  assert.ok(!logs.join('').includes(signature));
+  assert.ok(!logs.join('').includes(webhookAppSecret));
+});
+
+await test('POST rejects changed bytes even when the JSON has the same meaning', async (t) => {
+  const { url, recorded, jobs } = await startApp(t);
+  const payload = payloadWith({ messages: [textMessage()] });
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-hub-signature-256': signWebhook(JSON.stringify(payload)),
+    },
+    body: JSON.stringify(payload, null, 2),
+  });
+
+  assert.equal(response.status, 403);
+  assert.deepEqual(await response.json(), { error: 'Forbidden' });
+  assert.deepEqual(recorded, []);
+  assert.deepEqual(jobs, []);
+});
+
+await test('POST checks authenticity before reporting malformed JSON', async (t) => {
+  const { url, recorded, jobs, logs } = await startApp(t);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-hub-signature-256': signWebhook('{}'),
+    },
+    body: '{"private":"PRIVATE_UNSIGNED_JSON",',
+  });
+
+  assert.equal(response.status, 403);
+  assert.deepEqual(await response.json(), { error: 'Forbidden' });
+  assert.deepEqual(recorded, []);
+  assert.deepEqual(jobs, []);
+  assert.doesNotMatch(logs.join(''), /PRIVATE_UNSIGNED_JSON/);
+});
+
+for (const signCompressedBytes of [false, true]) {
+  await test(`POST rejects compressed bodies without inflating them (compressed signature: ${String(signCompressedBytes)})`, async (t) => {
+    const { url, recorded, jobs } = await startApp(t);
+    const body = JSON.stringify(payloadWith({ messages: [textMessage()] }));
+    const compressed = gzipSync(body);
+    const signature = signCompressedBytes
+      ? `sha256=${createHmac('sha256', webhookAppSecret).update(compressed).digest('hex')}`
+      : signWebhook(body);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-encoding': 'gzip',
+        'x-hub-signature-256': signature,
+      },
+      body: compressed,
+    });
+
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: 'Forbidden' });
+    assert.deepEqual(recorded, []);
+    assert.deepEqual(jobs, []);
+  });
+}
+
 await test('POST acknowledges a batch and logs only the validated payload metadata', async (t) => {
   const { url, logs } = await startApp(t);
   const payload = payloadWith({
@@ -153,7 +310,7 @@ await test('POST acknowledges a batch and logs only the validated payload metada
     }).entry,
   );
 
-  const response = await fetch(url, {
+  const response = await signedWebhookRequest(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
@@ -182,7 +339,7 @@ await test('POST accepts a message without a phone number and status-only change
   payload.entry.push(
     ...payloadWith({ statuses: [{ id: 'wamid.delivery', status: 'delivered' }] }).entry,
   );
-  const response = await fetch(url, {
+  const response = await signedWebhookRequest(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
@@ -222,7 +379,7 @@ const malformedPayloads: { name: string; body: unknown }[] = [
 for (const { name, body } of malformedPayloads) {
   await test(`POST returns 400 for ${name}`, async (t) => {
     const { url, logs } = await startApp(t);
-    const response = await fetch(url, {
+    const response = await signedWebhookRequest(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
@@ -237,7 +394,7 @@ await test('POST rejects a malformed later entry before logging any accepted pay
   const { url, logs } = await startApp(t);
   const payload = payloadWith({ messages: [{ id: 'wamid.valid' }] });
   payload.entry.push({ id: 'invalid-account', changes: [] });
-  const response = await fetch(url, {
+  const response = await signedWebhookRequest(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
@@ -262,7 +419,7 @@ for (const { name, body, contentType } of [
 ]) {
   await test(`POST maps ${name} to 400 without logging the raw body`, async (t) => {
     const { url, logs } = await startApp(t);
-    const response = await fetch(url, {
+    const response = await signedWebhookRequest(url, {
       method: 'POST',
       headers: { 'content-type': contentType },
       body,
@@ -283,7 +440,7 @@ await test('POST returns a generic 500 for an unexpected failure', async (t) => 
     },
     { times: 1 },
   );
-  const response = await fetch(url, {
+  const response = await signedWebhookRequest(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payloadWith({ messages: [{ id: 'wamid.example' }] })),
@@ -307,7 +464,7 @@ await test('POST saves each text message, then enqueues jobs carrying its databa
   const { url, jobs, recorded, calls, logs } = await startApp(t);
   const payload = payloadWith({ messages: [textMessage('wamid.first')] });
   payload.entry.push(...payloadWith({ messages: [textMessage('wamid.second')] }).entry);
-  const response = await fetch(url, {
+  const response = await signedWebhookRequest(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-correlation-id': 'webhook-queue-test' },
     body: JSON.stringify(payload),
@@ -329,6 +486,7 @@ await test('POST saves each text message, then enqueues jobs carrying its databa
   assert.deepEqual(
     jobs,
     ['wamid.first', 'wamid.second'].map((whatsappMessageId) => ({
+      webhookVerified: true,
       correlationId: 'webhook-queue-test',
       messageId: `message-${whatsappMessageId}`,
       userId: 'user-15550000001',
@@ -350,7 +508,7 @@ await test('POST returns 500 and enqueues nothing when saving a message fails', 
       saveOutboundMessage: () => Promise.reject(new Error('Webhook tests must not save replies')),
     },
   });
-  const response = await fetch(url, {
+  const response = await signedWebhookRequest(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-correlation-id': 'database-failure-test' },
     body: JSON.stringify(payloadWith({ messages: [textMessage()] })),
@@ -365,7 +523,7 @@ await test('POST reports queue failure as 500 instead of acknowledging lost work
   const { url, logs } = await startApp(t, {
     queue: { enqueue: () => Promise.reject(new Error('PRIVATE_QUEUE_FAILURE')) },
   });
-  const response = await fetch(url, {
+  const response = await signedWebhookRequest(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-correlation-id': 'queue-failure-test' },
     body: JSON.stringify(payloadWith({ messages: [textMessage()] })),
@@ -377,7 +535,7 @@ await test('POST reports queue failure as 500 instead of acknowledging lost work
 
 await test('POST rejects a malformed later text message before saving or enqueueing', async (t) => {
   const { url, jobs, recorded } = await startApp(t);
-  const response = await fetch(url, {
+  const response = await signedWebhookRequest(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(
@@ -396,7 +554,7 @@ await test('POST rejects a malformed later text message before saving or enqueue
 for (const timestamp of [undefined, 'not-a-timestamp', '-1', 1794844800, '8640000000001']) {
   await test(`POST rejects an invalid text-message timestamp: ${String(timestamp)}`, async (t) => {
     const { url, jobs } = await startApp(t);
-    const response = await fetch(url, {
+    const response = await signedWebhookRequest(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payloadWith({ messages: [{ ...textMessage(), timestamp }] })),
@@ -416,7 +574,7 @@ await test('POST acknowledges statuses, non-text and phone-less messages without
     ],
   });
   payload.entry.push(...payloadWith({ statuses: [{ status: 'delivered' }] }).entry);
-  const response = await fetch(url, {
+  const response = await signedWebhookRequest(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),

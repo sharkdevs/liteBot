@@ -11,6 +11,33 @@ import { createLogger } from '../src/config/logger.js';
 
 const execFileAsync = promisify(execFile);
 
+await test('startup rejects an unconfigured WhatsApp app secret before connecting', async () => {
+  await assert.rejects(
+    execFileAsync(
+      process.execPath,
+      ['--import', 'tsx', fileURLToPath(new URL('../src/server.ts', import.meta.url))],
+      {
+        env: {
+          ...process.env,
+          PORT: '3000',
+          LOG_LEVEL: 'info',
+          WHATSAPP_VERIFY_TOKEN: 'test-verification-token',
+          WHATSAPP_APP_SECRET: '',
+          DATABASE_URL: '',
+        },
+        timeout: 10_000,
+      },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error && 'code' in error && 'stderr' in error);
+      assert.equal(error.code, 1);
+      assert.ok(typeof error.stderr === 'string');
+      assert.match(error.stderr, /WHATSAPP_APP_SECRET must be configured/);
+      return true;
+    },
+  );
+});
+
 await test('startup rejects an unconfigured webhook verification token', async () => {
   await assert.rejects(
     execFileAsync(
@@ -35,6 +62,7 @@ await test('health returns the Stage 1 response without database or Redis connec
   const server = createApp({
     logger: createLogger('silent'),
     whatsappVerifyToken: 'test-verification-token',
+    whatsappAppSecret: 'synthetic-app-secret',
     conversationService: {
       recordInboundMessage: () => Promise.reject(new Error('Health requests must not save data')),
       getRecentMessages: () => Promise.resolve([]),
@@ -76,7 +104,8 @@ await test('an occupied port produces an error and a nonzero exit, not a success
           PORT: String(address.port),
           LOG_LEVEL: 'info',
           WHATSAPP_VERIFY_TOKEN: 'test-verification-token',
-          DATABASE_URL: 'postgresql://litebot:litebot@127.0.0.1:1/litebot',
+          WHATSAPP_APP_SECRET: 'synthetic-app-secret',
+          DATABASE_URL: 'postgresql://127.0.0.1:1/litebot',
           REDIS_HOST: '127.0.0.1',
           REDIS_PORT: '1',
         },
@@ -126,9 +155,10 @@ for (const entrypoint of ['worker.ts', 'whatsapp.worker.ts']) {
             LOG_LEVEL: 'info',
             PORT: 'not-used-by-worker',
             WHATSAPP_VERIFY_TOKEN: '',
+            WHATSAPP_APP_SECRET: '',
             REDIS_HOST: '127.0.0.1',
             REDIS_PORT: String(address.port),
-            DATABASE_URL: 'postgresql://test:test@127.0.0.1:5432/litebot',
+            DATABASE_URL: 'postgresql://127.0.0.1:1/litebot',
             AI_PROVIDER: 'azure-foundry',
             AZURE_AI_FOUNDRY_ENDPOINT: 'https://foundry.example.com/openai/v1/',
             AZURE_AI_FOUNDRY_API_KEY: 'synthetic-key',
